@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dossiês de Audiência — Downloader de Autos do eproc
 // @namespace    dossies-audiencia-download
-// @version      0.2.0
+// @version      0.3.0
 // @description  Automatiza busca, identificação de denúncia/IP/mídia e download de autos do eproc para dossiês de audiência. Ver README e docs/DECISOES.md deste repositório para o escopo da v1.
 // @author       lordfenriss
 // @homepageURL  https://github.com/lordfenriss/eproc-download-pub
@@ -95,15 +95,22 @@
     // ajustados aqui quando o eproc mudar o HTML — foi exatamente o que
     // fez o Evento 1 "sumir" nos testes anteriores.
     tabelaEventosSelector: '#tblEventos',
-    // Tentados em ordem, por linha de evento; para no primeiro que devolver
-    // algum link. Se nenhum bater, documentosDaLinha() ainda tenta um
-    // fallback por formato do rótulo (rotuloDocumentoRegex).
+    // UNIDOS (não "o primeiro que bater"): o diagnóstico de 08/09/2026 mostrou
+    // uma linha com documento sigiloso, cuja classe é infraLinkDocumentoSigiloso
+    // e não infraLinkDocumento — numa linha que tivesse os dois, parar no
+    // primeiro seletor perderia o outro documento. `data-doc` vem primeiro por
+    // ser o mais confiável: no processo diagnosticado, os 107 links de
+    // documento tinham data-doc, contra 106 com class="infraLinkDocumento".
     documentoLinkSelectors: [
-      'a.infraLinkDocumento',
       'a[data-doc]',
+      'a.infraLinkDocumento',
+      'a.infraLinkDocumentoSigiloso',
       'a[href*="acessar_documento"]',
       'a[onclick*="acessar_documento" i]',
     ],
+    // Classe que o eproc dá ao link quando o documento é sigiloso. Só marca o
+    // documento no log — não muda o que é baixado (quem opera já tem acesso).
+    documentoSigilosoSelector: 'a.infraLinkDocumentoSigiloso',
     // Formato dos rótulos de documento do eproc: "INIC1", "DENUNCIA1",
     // "VIDEO2", "OFIC3"... — maiúsculas, sem espaço.
     rotuloDocumentoRegex: /^[A-ZÁÂÃÉÊÍÓÔÕÚÇ]{3,}[A-ZÁÂÃÉÊÍÓÔÕÚÇ0-9_.\-]*$/,
@@ -255,15 +262,18 @@
     return Array.from(raiz.querySelectorAll('tr[id^="trEvento"]'));
   }
 
-  // Links de documento de uma linha: tenta CONFIG.documentoLinkSelectors em
-  // ordem e para no primeiro que devolver algo; se nenhum bater, cai no
-  // fallback por formato do rótulo, para o caso de o eproc ter trocado a
-  // classe CSS dos links.
+  // Links de documento de uma linha: UNIÃO de todos os seletores de
+  // CONFIG.documentoLinkSelectors, deduplicada (um mesmo <a> casa com vários).
+  // Parar no primeiro seletor que desse resultado perderia, numa linha com
+  // documento comum + documento sigiloso, o que não casasse com o primeiro.
+  // Se nenhum seletor bater, cai no fallback por formato do rótulo, para o
+  // caso de o eproc trocar a classe CSS dos links.
   function documentosDaLinha(tr) {
+    const achados = new Set();
     for (const sel of CONFIG.documentoLinkSelectors) {
-      const achados = Array.from(tr.querySelectorAll(sel));
-      if (achados.length) return achados;
+      for (const a of tr.querySelectorAll(sel)) achados.add(a);
     }
+    if (achados.size) return Array.from(achados);
     return Array.from(tr.querySelectorAll('a[href]')).filter((a) =>
       CONFIG.rotuloDocumentoRegex.test((a.textContent || '').trim())
     );
@@ -295,8 +305,14 @@
     const mimetype = a.getAttribute('data-mimetype') || '';
     return {
       rotulo,
-      href: a.getAttribute('href') || '',
+      // `a.href` (propriedade), NÃO `a.getAttribute('href')`: no eproc o
+      // atributo é relativo ("controlador.php?acao=acessar_documento&..."),
+      // e GM_download exige URL absoluta — com o valor relativo TODO download
+      // falharia, mesmo com o documento corretamente localizado. Achado do
+      // diagnóstico de 08/09/2026.
+      href: a.href || '',
       numeroEvento,
+      sigiloso: typeof a.matches === 'function' && a.matches(CONFIG.documentoSigilosoSelector),
       codigoDocumento: a.getAttribute('data-doc') || '',
       // Formato "<evento>_<ROTULO>.<mimetype>" (ex.: "135_VIDEO2.mp4"),
       // que casa com CONFIG.mediaFilenamePattern.
@@ -388,6 +404,17 @@
   async function carregarTodosOsEventos({ maxIteracoes = 100, timeoutCargaMs = 6000, maxFalhasSeguidas = 2 } = {}) {
     let falhasSeguidas = 0;
     for (let i = 0; i < maxIteracoes; i++) {
+      // A tabela vem em ordem decrescente e contígua: se o Evento 1 (o mais
+      // antigo que existe) já está no DOM, não há página seguinte com nada
+      // novo. Achado do diagnóstico de 08/09/2026: o link "próxima página"
+      // NÃO some no fim da lista — continua lá e não traz nada, gastando dois
+      // cliques e ~12s até o loop desistir, e logando duas "falhas" que
+      // pareciam bug e não eram.
+      if (document.getElementById('trEvento1')) {
+        log(`Eventos: lista completa — o Evento 1 já está carregado (${i} clique(s) em "próxima página").`);
+        return;
+      }
+
       const linkProximaPagina = document.querySelector('a[href*="carregarProximaPagina"]')
         || findByText('a', CONFIG.labels.carregarProximaPagina);
       if (!linkProximaPagina) {
@@ -473,7 +500,7 @@
     if (linhaDenuncia) {
       const nome = `${prefixo}__denuncia.pdf`;
       await baixarComoArquivo(linhaDenuncia.href, nome);
-      log(`${numeroProcesso}: denúncia identificada pelo rótulo do evento ("${linhaDenuncia.rotulo}") — baixada como ${nome}.`);
+      log(`${numeroProcesso}: denúncia identificada pelo rótulo do evento ("${linhaDenuncia.rotulo}")${linhaDenuncia.sigiloso ? ' [documento SIGILOSO]' : ''} — baixada como ${nome}.`);
       return { encontrada: true, precisaConferencia: false };
     }
 
@@ -497,7 +524,7 @@
     if (evento1) {
       const nome = `${prefixo}__denuncia_CONFERIR.pdf`;
       await baixarComoArquivo(evento1.href, nome);
-      log(`${numeroProcesso}: rótulo de denúncia não encontrado; sem sinal de migração nos primeiros eventos. Baixado o Evento ${evento1.numeroEvento || '1'} ("${evento1.rotulo}") como candidato — ${nome}. CONFIRME manualmente (pode ser queixa-crime — ver Manual, seção 3.6).`, 'aviso');
+      log(`${numeroProcesso}: rótulo de denúncia não encontrado; sem sinal de migração nos primeiros eventos. Baixado o Evento ${evento1.numeroEvento || '1'} ("${evento1.rotulo}")${evento1.sigiloso ? ' [documento SIGILOSO]' : ''} como candidato — ${nome}. CONFIRME manualmente (pode ser queixa-crime — ver Manual, seção 3.6).`, 'aviso');
       return { encontrada: true, precisaConferencia: true };
     }
 
@@ -758,7 +785,11 @@
 
     const semDocumento = eventos.filter((e) => e.documentos.length === 0);
     add(`Eventos SEM nenhum link de documento reconhecido: ${semDocumento.length} de ${eventos.length}`);
-    add(`Total de documentos lidos: ${eventos.reduce((acc, e) => acc + e.documentos.length, 0)}`);
+    add('  (normal: eventos como "Conclusos para decisão/despacho" não têm documento)');
+    const todosDocs = eventos.flatMap((e) => e.documentos);
+    add(`Total de documentos lidos: ${todosDocs.length}`);
+    add(`Documentos SIGILOSOS (class="infraLinkDocumentoSigiloso"): ${todosDocs.filter((d) => d.sigiloso).length}`);
+    add(`Documentos com href relativo (não deveria haver nenhum): ${todosDocs.filter((d) => !/^https?:/i.test(d.href)).length}`);
     add('');
 
     add('Classes dos <a> dentro da tabela (histograma, top 20) — é aqui que se');
@@ -1106,6 +1137,20 @@
   }
 
   // ======================================================================
+  // Gancho de teste: quando globalThis.__EPROC_TESTE__ existe (só em
+  // scripts/testar-leitura-eventos.js, nunca no navegador), expõe as funções
+  // de leitura da tabela para poderem ser rodadas contra HTML real capturado
+  // pelo Diagnóstico. Testar uma cópia das funções não pegaria justamente os
+  // erros que já custaram três rodadas — o valor está em rodar ESTE código.
+  if (typeof globalThis !== 'undefined' && globalThis.__EPROC_TESTE__) {
+    globalThis.__EPROC_TESTE__ = {
+      CONFIG, lerEventos, lerLinhasEventos, localizarEvento1,
+      documentosDaLinha, documentoDoLink, eventoDaLinha, descricaoDoEvento,
+      tabelaEventos, linhasDeEvento, numeroDoEvento,
+    };
+    return; // não monta painel nem inicia a fila em ambiente de teste
+  }
+
   function iniciar() {
     criarPainel();
     // Retomada automática: se a fila estava em andamento (fase !== 'ocioso')
