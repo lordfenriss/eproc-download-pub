@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dossiês de Audiência — Downloader de Autos do eproc
 // @namespace    dossies-audiencia-download
-// @version      0.3.0
+// @version      0.4.0
 // @description  Automatiza busca, identificação de denúncia/IP/mídia e download de autos do eproc para dossiês de audiência. Ver README e docs/DECISOES.md deste repositório para o escopo da v1.
 // @author       lordfenriss
 // @homepageURL  https://github.com/lordfenriss/eproc-download-pub
@@ -121,6 +121,31 @@
     // Padrão de nome sugerido pelo eproc para mídia, informado pelo usuário:
     // "<evento>_VIDEO<n>.<ext>" (também vale AUDIO no lugar de VIDEO).
     mediaFilenamePattern: /^(\d+)_(VIDEO|AUDIO)(\d+)\.(\w+)$/i,
+    // ------------------------------------------------------------------
+    // Fluxo "Download Completo" (as partes dos autos). Os rótulos vêm do
+    // Manual; os seletores são heurísticas por TEXTO de propósito — o
+    // episódio do documento sigiloso (08/09/2026) mostrou que classe CSS é
+    // o que quebra primeiro quando o eproc muda.
+    // ------------------------------------------------------------------
+    downloadCompleto: {
+      // O que fazer com cada checkbox da tela de opções.
+      //   null  = NÃO MEXER (usa o que o eproc já traz marcado) — padrão
+      //   true  = forçar marcada
+      //   false = forçar desmarcada
+      // Padrão conservador: não mexer em nada e só REGISTRAR NO LOG o estado
+      // de cada uma. Mexer às cegas no que o eproc já traz pode mudar o
+      // conteúdo do PDF sem ninguém perceber. Depois do primeiro download
+      // real, ajuste aqui conforme o Manual.
+      checkboxes: {
+        listaEventos: null,
+        anexosEletronicos: null,
+        soComDocumentos: null,
+      },
+      // Quantas partes no máximo procurar numa tela (trava de segurança).
+      maxPartes: 50,
+      // Tempo máximo esperando a tela de opções aparecer depois do clique.
+      timeoutTelaMs: 30000,
+    },
     mediaMinBytes: 20 * 1024, // abaixo disso e sem Content-Type de mídia, é suspeito (ver docs/DECISOES.md, ponto 6)
     limiteFontesNotebookLM: 50,
     // Intervalo e tentativas máximas ao esperar o "Download Completo" ficar pronto.
@@ -130,6 +155,21 @@
 
   const STATE_KEY = 'eprocDownloaderState_v1';
   const LOG_KEY = 'eprocDownloaderLog_v1';
+  const MANIFESTO_KEY = 'eprocDownloaderManifesto_v1';
+  const OPCOES_KEY = 'eprocDownloaderOpcoes_v1';
+
+  // O que o script baixa. Marcável no painel — o usuário que precisa dos
+  // AUTOS num dia corrido pode desligar denúncia e mídia e não pagar o tempo
+  // desses passos.
+  function loadOpcoes() {
+    return Object.assign(
+      { autos: true, denuncia: true, midia: true, ips: true },
+      GM_getValue(OPCOES_KEY, {})
+    );
+  }
+  function saveOpcoes(opcoes) {
+    GM_setValue(OPCOES_KEY, opcoes);
+  }
 
   // ======================================================================
   // Estado persistente — necessário porque navegação de página inteira
@@ -489,6 +529,240 @@
   }
 
   // ======================================================================
+  // "Download Completo" — as partes dos autos. Peças de apoio.
+  //
+  // Tudo aqui procura por TEXTO, não por classe CSS: o episódio do documento
+  // sigiloso (08/09/2026) mostrou que a classe é o que quebra primeiro. E
+  // todo passo que não acha o que procura chama diagnosticoTela(), que baixa
+  // um .txt com o que HAVIA na tela naquele instante — para o próximo ajuste
+  // sair numa rodada, e não em três.
+  // ======================================================================
+
+  // Texto "clicável" de um elemento: <input type=submit> guarda o rótulo em
+  // value, não em textContent — sem isso, botões de formulário não são achados.
+  function textoDeControle(el) {
+    if (el.tagName === 'INPUT') return (el.value || el.getAttribute('value') || '').trim();
+    return (el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function controlesClicaveis(raiz = document) {
+    return Array.from(raiz.querySelectorAll('a, button, input[type="submit"], input[type="button"]'));
+  }
+
+  // Acha um controle cujo texto contenha `texto`. Prefere a correspondência
+  // mais curta: numa tela com "BAIXAR ARQUIVO" e "BAIXAR ARQUIVO PARTE 1",
+  // procurar "BAIXAR ARQUIVO" tem de achar o primeiro, não o segundo.
+  function acharControle(texto, { raiz = document, visivel = true } = {}) {
+    const alvo = texto.toLowerCase();
+    const candidatos = controlesClicaveis(raiz)
+      .filter((el) => textoDeControle(el).toLowerCase().includes(alvo))
+      .filter((el) => !visivel || el.offsetParent !== null || el.getClientRects().length > 0)
+      .sort((a, b) => textoDeControle(a).length - textoDeControle(b).length);
+    return candidatos[0] || null;
+  }
+
+  function acharTodosControles(texto, { raiz = document } = {}) {
+    const alvo = texto.toLowerCase();
+    return controlesClicaveis(raiz).filter((el) => textoDeControle(el).toLowerCase().includes(alvo));
+  }
+
+  // Espera um controle com esse texto aparecer (a tela do eproc pode demorar
+  // ou vir por navegação). Devolve null no timeout — quem chama decide.
+  async function aguardarControle(texto, { timeoutMs = 20000, intervaloMs = 400 } = {}) {
+    const inicio = Date.now();
+    while (Date.now() - inicio < timeoutMs) {
+      const el = acharControle(texto);
+      if (el) return el;
+      await sleep(intervaloMs);
+    }
+    return null;
+  }
+
+  // Checkbox pelo texto do <label> associado (ou do texto ao redor).
+  function acharCheckboxPorTexto(texto) {
+    const alvo = texto.toLowerCase().slice(0, 60);
+    for (const input of document.querySelectorAll('input[type="checkbox"]')) {
+      const rotuloDoFor = input.id ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`) : null;
+      const contexto = [
+        rotuloDoFor && rotuloDoFor.textContent,
+        input.closest('label') && input.closest('label').textContent,
+        input.parentElement && input.parentElement.textContent,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .toLowerCase();
+      if (contexto.includes(alvo)) return input;
+    }
+    return null;
+  }
+
+  // Dump da tela atual quando um passo não acha o que esperava. É o mesmo
+  // princípio do Diagnóstico da tabela: transformar "não funcionou" em dado
+  // acionável na primeira tentativa.
+  function diagnosticoTela(motivo) {
+    const linhas = [];
+    linhas.push('=== DIAGNÓSTICO DE TELA — eproc-downloader ===');
+    linhas.push(`Motivo: ${motivo}`);
+    linhas.push(`Data: ${new Date().toISOString()}`);
+    linhas.push(`URL: ${location.href}`);
+    linhas.push(`Título: ${document.title}`);
+    linhas.push('');
+    linhas.push('--- Controles clicáveis visíveis (tag | texto | href/onclick) ---');
+    for (const el of controlesClicaveis()) {
+      const visivel = el.offsetParent !== null || el.getClientRects().length > 0;
+      if (!visivel) continue;
+      const alvo = el.getAttribute('href') || el.getAttribute('onclick') || '';
+      linhas.push(`  ${el.tagName} | "${textoDeControle(el).slice(0, 90)}" | ${alvo.slice(0, 120)}`);
+    }
+    linhas.push('');
+    linhas.push('--- Checkboxes (marcada? | id | texto ao redor) ---');
+    for (const input of document.querySelectorAll('input[type="checkbox"]')) {
+      const perto = ((input.closest('label') || input.parentElement || {}).textContent || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 110);
+      linhas.push(`  ${input.checked ? '[x]' : '[ ]'} | id="${input.id}" | ${perto}`);
+    }
+    linhas.push('');
+    linhas.push('--- Texto visível da página (primeiros 3000 caracteres) ---');
+    linhas.push((document.body.innerText || '').replace(/\n{3,}/g, '\n\n').slice(0, 3000));
+    return finalizarDiagnostico(linhas, 'eproc-diagnostico-tela');
+  }
+
+  // ----------------------------------------------------------------------
+  // Manifesto de downloads. Existe porque nem todo botão de "baixar parte"
+  // do eproc é um <a href> que dá para passar ao GM_download com um nome
+  // nosso: quando é só um clique em JS, quem nomeia o arquivo é o eproc, e
+  // o nome não diz de que processo veio. O manifesto registra, a cada
+  // download, o processo/IP e o instante do clique — e
+  // scripts/organizar_autos.py usa isso para casar os arquivos por horário
+  // de criação e renomear. Sem ele, um lote de "documento1.pdf",
+  // "documento2.pdf" vira um quebra-cabeça manual.
+  // ----------------------------------------------------------------------
+  function registrarNoManifesto(entrada) {
+    const manifesto = GM_getValue(MANIFESTO_KEY, []);
+    manifesto.push({ ts: new Date().toISOString(), ...entrada });
+    GM_setValue(MANIFESTO_KEY, manifesto);
+  }
+
+  function exportarManifesto() {
+    const manifesto = GM_getValue(MANIFESTO_KEY, []);
+    if (manifesto.length === 0) {
+      log('Nada para exportar — nenhum download registrado no manifesto ainda.', 'aviso');
+      return;
+    }
+    baixarTexto(
+      `eproc-manifesto-${new Date().toISOString().replace(/[:.]/g, '-')}.json`,
+      JSON.stringify(manifesto, null, 2)
+    );
+    log(`Manifesto exportado (${manifesto.length} download(s)). Passe-o ao organizar_autos.py com --manifesto.`);
+  }
+
+  // ----------------------------------------------------------------------
+  // Baixa todas as partes dos autos visíveis na tela de download.
+  // `prefixo` já vem pronto ("<processo>" ou "<processo>__IP_<numero>"), e
+  // a convenção de nome é a de docs/DECISOES.md, lida depois pelo organizador.
+  // ----------------------------------------------------------------------
+  async function baixarPartesDosAutos(prefixo, { numeroProcesso, ip = null } = {}) {
+    // "BAIXAR ARQUIVO PARTE 1", "BAIXAR ARQUIVO PARTE 2"... ou, quando o
+    // documento coube num arquivo só, um único "BAIXAR ARQUIVO".
+    let botoes = acharTodosControles(CONFIG.labels.baixarArquivoParte);
+    let temPartes = botoes.length > 0;
+    if (!temPartes) {
+      const unico = acharControle(CONFIG.labels.baixarArquivo);
+      botoes = unico ? [unico] : [];
+    }
+
+    if (botoes.length === 0) {
+      log(`${numeroProcesso}: tela de download aberta, mas nenhum botão "${CONFIG.labels.baixarArquivo}" foi encontrado. Gerando diagnóstico de tela.`, 'erro');
+      diagnosticoTela(`nenhum botão de baixar parte encontrado (processo ${numeroProcesso}${ip ? `, IP ${ip}` : ''})`);
+      return { baixadas: 0, viaClique: 0 };
+    }
+
+    if (botoes.length > CONFIG.downloadCompleto.maxPartes) {
+      log(`${numeroProcesso}: ${botoes.length} botões de parte encontrados, acima do limite de segurança (${CONFIG.downloadCompleto.maxPartes}). Baixando só os primeiros — confira manualmente.`, 'aviso');
+      botoes = botoes.slice(0, CONFIG.downloadCompleto.maxPartes);
+    }
+
+    // Ordena pelo número da parte que aparece no rótulo, para PARTE_2 não
+    // virar PARTE_10 por acidente de ordem no DOM.
+    botoes.sort((a, b) => numeroDaParte(a) - numeroDaParte(b));
+
+    let baixadas = 0;
+    let viaClique = 0;
+    for (let i = 0; i < botoes.length; i++) {
+      const botao = botoes[i];
+      const parte = temPartes ? numeroDaParte(botao) || i + 1 : 1;
+      const nome = temPartes
+        ? `${prefixo}__AUTOS_PARTE_${parte}.pdf`
+        : `${prefixo}__AUTOS.pdf`;
+      const href = botao.tagName === 'A' ? botao.href : '';
+      const hrefUtilizavel = href && /^https?:/i.test(href) && !/^javascript:/i.test(botao.getAttribute('href') || '');
+
+      if (hrefUtilizavel) {
+        try {
+          await baixarComoArquivo(href, nome);
+          registrarNoManifesto({ processo: numeroProcesso, ip, rotulo: textoDeControle(botao), nomeArquivo: nome, viaClique: false });
+          baixadas += 1;
+          log(`${numeroProcesso}: autos — ${nome} baixado.`);
+        } catch (e) {
+          log(`${numeroProcesso}: falha ao baixar ${nome}: ${e && e.message ? e.message : e}`, 'erro');
+        }
+      } else {
+        // Sem href utilizável: só resta clicar, e quem nomeia é o eproc. O
+        // manifesto guarda o instante do clique para o organizador casar
+        // depois pelo horário do arquivo.
+        botao.click();
+        registrarNoManifesto({ processo: numeroProcesso, ip, rotulo: textoDeControle(botao), nomeArquivo: nome, viaClique: true });
+        viaClique += 1;
+        baixadas += 1;
+        log(`${numeroProcesso}: autos — parte ${parte} baixada por clique (o eproc é quem nomeia o arquivo; o manifesto registra que ela é deste processo${ip ? `, IP ${ip}` : ''}).`, 'aviso');
+        // Respiro entre cliques: downloads em rajada são justamente o que o
+        // Chrome bloqueia (ver comentário de baixarComoArquivo).
+        await sleep(1500);
+      }
+    }
+    return { baixadas, viaClique };
+  }
+
+  function numeroDaParte(el) {
+    const m = textoDeControle(el).match(/parte\s*(\d+)/i);
+    return m ? Number(m[1]) : 0;
+  }
+
+  // Aplica CONFIG.downloadCompleto.checkboxes e registra no log o estado de
+  // cada uma — mesmo quando a política é "não mexer", porque saber como o
+  // eproc veio marcado é o que permite decidir depois do primeiro download.
+  function configurarOpcoesDownloadCompleto(numeroProcesso) {
+    const mapa = [
+      ['listaEventos', CONFIG.labels.checkboxListaEventos],
+      ['anexosEletronicos', CONFIG.labels.checkboxAnexosEletronicos],
+      ['soComDocumentos', CONFIG.labels.checkboxSoComDocumentos],
+    ];
+    const relato = [];
+    for (const [chave, rotulo] of mapa) {
+      const input = acharCheckboxPorTexto(rotulo);
+      if (!input) {
+        relato.push(`${chave}=NÃO ENCONTRADA`);
+        continue;
+      }
+      const desejado = CONFIG.downloadCompleto.checkboxes[chave];
+      if (desejado === null || desejado === undefined) {
+        relato.push(`${chave}=${input.checked ? 'marcada' : 'desmarcada'} (mantida)`);
+        continue;
+      }
+      if (input.checked !== desejado) {
+        input.click();
+        relato.push(`${chave}=${desejado ? 'marcada' : 'desmarcada'} (ALTERADA pelo script)`);
+      } else {
+        relato.push(`${chave}=${input.checked ? 'marcada' : 'desmarcada'} (já estava)`);
+      }
+    }
+    log(`${numeroProcesso}: opções do Download Completo — ${relato.join(', ')}.`);
+  }
+
+  // ======================================================================
   // Passo: identificar e baixar a denúncia (ver docs/DECISOES.md, ponto 4)
   // ======================================================================
   async function tratarDenuncia(numeroProcesso, linhasEventos, eventos) {
@@ -625,6 +899,10 @@
     #eproc-dl-painel h3 { margin: 0; font-size: 13px; }
     #eproc-dl-fechar { border: none; background: none; font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px; }
     #eproc-dl-painel button { margin: 2px 4px 2px 0; padding: 4px 8px; cursor: pointer; }
+    #eproc-dl-painel .opcoes { margin: 6px 0; padding: 5px; background: #f7f7f7; border: 1px solid #e2e2e2; border-radius: 4px; }
+    #eproc-dl-painel .opcoes label { display: inline-block; margin-right: 8px; white-space: nowrap; cursor: pointer; }
+    #eproc-dl-painel .opcoes input { vertical-align: -1px; margin-right: 2px; }
+    #eproc-dl-autos-agora { font-weight: bold; }
     #eproc-dl-painel .log { background: #f4f4f4; border: 1px solid #ddd; padding: 4px;
       max-height: 220px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; font-size: 11px; }
     #eproc-dl-painel .aviso { color: #a15c00; }
@@ -657,7 +935,18 @@
         <button id="eproc-dl-parar">Parar</button>
         <button id="eproc-dl-limpar-log">Limpar log</button>
         <button id="eproc-dl-exportar-log">Exportar log</button>
+        <button id="eproc-dl-manifesto" title="Baixa o manifesto (.json) com o processo/IP de cada arquivo baixado — use com organizar_autos.py --manifesto">Manifesto</button>
         <button id="eproc-dl-diagnostico" title="Gera um relatório da estrutura da tabela de eventos desta página (.txt) para investigar seletores que não bateram">Diagnóstico</button>
+      </div>
+      <div class="opcoes">
+        <strong>Baixar:</strong>
+        <label><input type="checkbox" id="eproc-dl-opt-autos"> autos completos</label>
+        <label><input type="checkbox" id="eproc-dl-opt-denuncia"> denúncia</label>
+        <label><input type="checkbox" id="eproc-dl-opt-midia"> mídia</label>
+        <label><input type="checkbox" id="eproc-dl-opt-ips"> IPs referenciados</label>
+      </div>
+      <div>
+        <button id="eproc-dl-autos-agora" title="Roda o Download Completo no processo já aberto nesta página, sem depender da fila/CSV">Baixar autos desta página</button>
       </div>
       <div id="eproc-dl-status"></div>
       <div class="log" id="eproc-dl-log"></div>
@@ -672,6 +961,23 @@
       renderLog();
     });
     document.getElementById('eproc-dl-exportar-log').addEventListener('click', exportarLog);
+    document.getElementById('eproc-dl-manifesto').addEventListener('click', exportarManifesto);
+    document.getElementById('eproc-dl-autos-agora').addEventListener('click', () => {
+      baixarAutosDaPaginaAtual().catch((e) => log(`Falha ao baixar autos desta página: ${e && e.message ? e.message : e}`, 'erro'));
+    });
+
+    // Opções de o que baixar, persistidas (sobrevivem à navegação como o resto).
+    for (const [chave, id] of [['autos', 'eproc-dl-opt-autos'], ['denuncia', 'eproc-dl-opt-denuncia'], ['midia', 'eproc-dl-opt-midia'], ['ips', 'eproc-dl-opt-ips']]) {
+      const input = document.getElementById(id);
+      input.checked = loadOpcoes()[chave];
+      input.addEventListener('change', () => {
+        const opcoes = loadOpcoes();
+        opcoes[chave] = input.checked;
+        saveOpcoes(opcoes);
+        log(`Opção "${chave}" ${input.checked ? 'ligada' : 'desligada'}.`);
+      });
+    }
+
     document.getElementById('eproc-dl-diagnostico').addEventListener('click', () => {
       log('Rodando diagnóstico da tabela de eventos (isso carrega todas as páginas de eventos e pode demorar)...');
       diagnosticoTabelaEventos().catch((e) => log(`Diagnóstico falhou: ${e && e.message ? e.message : e}`, 'erro'));
@@ -835,10 +1141,10 @@
     return finalizarDiagnostico(linhas);
   }
 
-  function finalizarDiagnostico(linhas) {
+  function finalizarDiagnostico(linhas, prefixoNome = 'eproc-diagnostico-eventos') {
     const texto = `${linhas.join('\n')}\n`;
     console.log('[eproc-downloader] DIAGNÓSTICO:\n' + texto);
-    const nome = `eproc-diagnostico-eventos-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
+    const nome = `${prefixoNome}-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
     baixarTexto(nome, texto);
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(texto).catch(() => {});
@@ -981,6 +1287,181 @@
     );
   }
 
+  // ======================================================================
+  // Sub-máquina do "Download Completo".
+  //
+  // POR QUE É UMA MÁQUINA DE ESTADOS E NÃO UMA FUNÇÃO COM AWAIT:
+  // não se sabe (ainda não testado contra a tela real) se "Download Completo"
+  // abre um modal na mesma página ou NAVEGA para outra tela. Se navegar,
+  // qualquer `await` depois do clique nunca retorna — foi exatamente essa
+  // armadilha que já derrubou o fluxo da busca em 03/09/2026. Escrever como
+  // sub-fases persistidas funciona nos DOIS casos: o passo é salvo em
+  // `state.autos.sub` ANTES do clique, e retomado do zero na carga seguinte
+  // se houve navegação, ou seguido inline se não houve.
+  //
+  // Devolve:
+  //   'continuar' — etapa dos autos terminou, o chamador segue o fluxo
+  //   'navegou'   — a página vai recarregar; avancarFila() deve retornar
+  // ======================================================================
+  async function avancarAutos(state) {
+    const autos = state.autos;
+    const { numeroProcesso, ip, prefixo } = autos.contexto;
+    const rotuloAlvo = ip ? `${numeroProcesso} (IP ${ip})` : numeroProcesso;
+
+    if (autos.sub === 'abrir') {
+      const botao = acharControle(CONFIG.labels.downloadCompleto);
+      if (!botao) {
+        log(`${rotuloAlvo}: botão "${CONFIG.labels.downloadCompleto}" não encontrado nesta tela. Gerando diagnóstico e pulando os autos deste item.`, 'erro');
+        diagnosticoTela(`botão "${CONFIG.labels.downloadCompleto}" não encontrado (${rotuloAlvo})`);
+        return 'continuar';
+      }
+      autos.sub = 'opcoes';
+      saveState(state); // ANTES do clique: se navegar, a fase já está salva
+      log(`${rotuloAlvo}: abrindo "${CONFIG.labels.downloadCompleto}".`);
+      botao.click();
+      // Se for modal (mesma página), a tela de opções aparece aqui e seguimos
+      // inline. Se navegar, esta espera morre junto com a página e a próxima
+      // carga retoma em 'opcoes'.
+      const apareceu = await aguardarControle(CONFIG.labels.gerarArquivoCompleto, {
+        timeoutMs: CONFIG.downloadCompleto.timeoutTelaMs,
+      });
+      return apareceu ? 'continuar' : 'navegou';
+    }
+
+    if (autos.sub === 'opcoes') {
+      const gerar = await aguardarControle(CONFIG.labels.gerarArquivoCompleto, {
+        timeoutMs: CONFIG.downloadCompleto.timeoutTelaMs,
+      });
+      if (!gerar) {
+        log(`${rotuloAlvo}: a tela de opções do Download Completo não apareceu (botão "${CONFIG.labels.gerarArquivoCompleto}" não encontrado). Gerando diagnóstico e pulando os autos deste item.`, 'erro');
+        diagnosticoTela(`tela de opções não apareceu (${rotuloAlvo})`);
+        return 'continuar';
+      }
+      configurarOpcoesDownloadCompleto(rotuloAlvo);
+      autos.sub = 'gerando';
+      autos.tentativas = 0;
+      saveState(state);
+      log(`${rotuloAlvo}: clicando em "${CONFIG.labels.gerarArquivoCompleto}" — isso pode levar vários minutos.`);
+      gerar.click();
+      const pronto = await aguardarTextoNaPagina(CONFIG.labels.geradoComSucesso, { timeoutMs: 60000 });
+      return pronto ? 'continuar' : 'navegou';
+    }
+
+    if (autos.sub === 'gerando') {
+      // Espera longa e com log de progresso: o eproc pode levar ~10 min num
+      // processo grande, e uma espera silenciosa parece travamento.
+      for (let i = autos.tentativas || 0; i < CONFIG.pollDownloadCompletoMaxTentativas; i++) {
+        if (temTextoNaPagina(CONFIG.labels.geradoComSucesso) || acharControle(CONFIG.labels.baixarArquivo)) {
+          autos.sub = 'baixando';
+          saveState(state);
+          log(`${rotuloAlvo}: arquivo completo gerado.`);
+          return 'continuar';
+        }
+        autos.tentativas = i + 1;
+        saveState(state);
+        const minutos = Math.round(((i + 1) * CONFIG.pollDownloadCompletoMs) / 60000);
+        if ((i + 1) % 4 === 0) {
+          log(`${rotuloAlvo}: ainda gerando o arquivo completo (~${minutos} min). Mantenha esta aba em primeiro plano.`);
+        }
+        await sleep(CONFIG.pollDownloadCompletoMs);
+      }
+      log(`${rotuloAlvo}: o arquivo completo não ficou pronto dentro do limite (~${Math.round((CONFIG.pollDownloadCompletoMaxTentativas * CONFIG.pollDownloadCompletoMs) / 60000)} min). Gerando diagnóstico e seguindo — baixe este processo manualmente.`, 'erro');
+      diagnosticoTela(`arquivo completo não ficou pronto no limite (${rotuloAlvo})`);
+      return 'continuar';
+    }
+
+    if (autos.sub === 'baixando') {
+      const resultado = await baixarPartesDosAutos(prefixo, { numeroProcesso, ip });
+      if (resultado.baixadas > 0) {
+        log(`${rotuloAlvo}: ${resultado.baixadas} parte(s) dos autos baixada(s)${resultado.viaClique ? ` (${resultado.viaClique} por clique — nome dado pelo eproc, ver manifesto)` : ''}.`);
+      }
+      const voltar = acharControle(CONFIG.labels.voltar);
+      if (voltar) {
+        saveState(state);
+        voltar.click();
+        await sleep(2000);
+      }
+      return 'continuar';
+    }
+
+    log(`${rotuloAlvo}: sub-fase de autos desconhecida ("${autos.sub}") — pulando os autos deste item.`, 'erro');
+    return 'continuar';
+  }
+
+  function temTextoNaPagina(texto) {
+    return (document.body.innerText || '').toLowerCase().includes(texto.toLowerCase());
+  }
+
+  async function aguardarTextoNaPagina(texto, { timeoutMs = 30000, intervaloMs = 500 } = {}) {
+    const inicio = Date.now();
+    while (Date.now() - inicio < timeoutMs) {
+      if (temTextoNaPagina(texto)) return true;
+      await sleep(intervaloMs);
+    }
+    return false;
+  }
+
+  // Prepara o state para entrar na etapa de autos e devolve para onde voltar
+  // quando ela terminar.
+  function entrarEmAutos(state, { numeroProcesso, ip = null, voltarPara }) {
+    state.autos = {
+      sub: 'abrir',
+      tentativas: 0,
+      voltarPara,
+      contexto: {
+        numeroProcesso,
+        ip,
+        prefixo: ip
+          ? `${nomeSeguro(numeroProcesso)}__IP_${nomeSeguro(ip)}`
+          : nomeSeguro(numeroProcesso),
+      },
+    };
+    state.fase = 'autos';
+    saveState(state);
+  }
+
+  // ======================================================================
+  // Botão "Baixar autos desta página": roda o Download Completo no processo
+  // que já está aberto, sem CSV e sem fila.
+  //
+  // É o plano B deliberado para um dia de trabalho: se a automação da fila
+  // esbarrar em qualquer coisa não prevista, dá para abrir o processo à mão e
+  // clicar aqui — perde-se a automação da lista, não o dia. Reaproveita a
+  // mesma sub-máquina, com uma fila de um item só.
+  // ======================================================================
+  async function baixarAutosDaPaginaAtual() {
+    const numeroProcesso = numeroDoProcessoDaPagina();
+    if (!numeroProcesso) {
+      log('Não consegui identificar o número do processo desta página — abra um processo antes de usar este botão. Gerando diagnóstico de tela.', 'erro');
+      diagnosticoTela('número do processo não identificado na página atual');
+      return;
+    }
+    const state = loadState() || newState([]);
+    if (!state.fila.find((p) => p.numero === numeroProcesso)) {
+      state.fila.push({ numero: numeroProcesso, status: 'em_andamento', ip: [], observacao: '' });
+    }
+    state.pausado = false;
+    state.processoAtual = numeroProcesso;
+    entrarEmAutos(state, { numeroProcesso, voltarPara: 'apos_autos_avulso' });
+    log(`${numeroProcesso}: baixando autos desta página (modo avulso, fora da fila).`);
+    await avancarFila();
+  }
+
+  // Número do processo a partir da própria página. Tenta a URL primeiro
+  // (num_processo=... vem sem pontuação) e cai para o texto da página.
+  function numeroDoProcessoDaPagina() {
+    const daPagina = (document.body.innerText || '').match(
+      /\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/
+    );
+    if (daPagina) return daPagina[0];
+    const daUrl = location.href.match(/num_processo=(\d{20})/);
+    if (daUrl) {
+      const d = daUrl[1];
+      return `${d.slice(0, 7)}-${d.slice(7, 9)}.${d.slice(9, 13)}.${d.slice(13, 14)}.${d.slice(14, 16)}.${d.slice(16, 20)}`;
+    }
+    return null;
+  }
+
   let processando = false; // trava só dentro de UMA carga de página — impede reentrância
 
   // ======================================================================
@@ -1003,6 +1484,28 @@
       while (true) {
         const state = loadState();
         if (!state || state.pausado) return;
+
+        if (state.fase === 'autos') {
+          const resultado = await avancarAutos(state);
+          if (resultado === 'navegou') return;
+          const voltarPara = state.autos.voltarPara;
+          state.autos = null;
+          state.fase = voltarPara;
+          saveState(state);
+          continue;
+        }
+
+        if (state.fase === 'apos_autos_avulso') {
+          // Modo avulso (botão "Baixar autos desta página"): terminou o item,
+          // não puxa o próximo da fila — quem clicou quer só este processo.
+          const item = state.fila.find((p) => p.numero === state.processoAtual);
+          if (item) item.status = 'concluido';
+          state.fase = 'ocioso';
+          state.pausado = true; // não retoma a fila sozinho na próxima carga
+          saveState(state);
+          log(`${state.processoAtual}: autos desta página processados. (Modo avulso — a fila segue pausada; clique "Iniciar" para rodar a fila do CSV.)`);
+          return;
+        }
 
         if (state.fase === 'ocioso') {
           const item = state.fila.find((p) => p.status === 'pendente' || p.status === 'em_andamento');
@@ -1056,15 +1559,34 @@
             log(`${numeroProcesso}: ${ips.length} inquérito(s) policial(is) referenciado(s): ${ips.join(', ')}.`);
           }
 
-          await tratarDenuncia(numeroProcesso, linhasEventos, eventos);
-          await tratarMidia(numeroProcesso, linhasEventos);
+          const opcoes = loadOpcoes();
+          if (opcoes.denuncia) await tratarDenuncia(numeroProcesso, linhasEventos, eventos);
+          if (opcoes.midia) await tratarMidia(numeroProcesso, linhasEventos);
+
+          // Autos completos ANTES de sair para o IP: a tela de Download
+          // Completo é do processo aberto agora, e buscar o IP navega para
+          // longe dela.
+          if (opcoes.autos) {
+            entrarEmAutos(state, { numeroProcesso, voltarPara: 'apos_autos_principal' });
+            continue;
+          }
+          state.fase = 'apos_autos_principal';
+          saveState(state);
+          continue;
+        }
+
+        if (state.fase === 'apos_autos_principal') {
+          const numeroProcesso = state.processoAtual;
+          const item = state.fila.find((p) => p.numero === numeroProcesso);
+          const ips = item.ip || [];
+          const opcoes = loadOpcoes();
 
           // Decisão do Ponto 2 (03/09/2026): rebuscar o número do IP na mesma
           // caixa de busca, em vez de clicar no link da caixa azul — evita a
           // dúvida sobre abrir em nova aba. Ainda não confirmado: se a busca
           // do topo aceita números de inquérito policial (só processo
           // "principal" foi testado).
-          if (ips.length > 0) {
+          if (ips.length > 0 && opcoes.ips) {
             state.ipIndiceAtual = 0;
             state.fase = 'aguardando_busca_ip';
             saveState(state);
@@ -1084,10 +1606,7 @@
           item.status = 'concluido';
           state.fase = 'ocioso';
           saveState(state);
-          // TODO: "Download Completo" (partes dos autos) — pendente porque os
-          // rótulos de checkbox do modal (CONFIG.labels.checkbox*) ainda não
-          // foram confirmados contra a tela real. Ver docs/DECISOES.md.
-          log(`${numeroProcesso}: denúncia e mídia processadas. Download Completo (partes dos autos) ainda não implementado — pendente de teste do modal.`, 'aviso');
+          log(`${numeroProcesso}: concluído.`);
           continue;
         }
 
@@ -1099,11 +1618,29 @@
           if (!tabela) {
             log(`${numeroProcesso}: IP ${ip} não abriu tabela de eventos ao rebuscar pelo número — pulado, revisar manualmente (ver Ponto 2 da decisão de 03/09/2026).`, 'erro');
           } else {
+            const opcoes = loadOpcoes();
             await carregarTodosOsEventos();
-            const linhasIp = lerLinhasEventos();
-            await tratarMidia(numeroProcesso, linhasIp, { prefixoExtra: `IP_${nomeSeguro(ip)}` });
+            if (opcoes.midia) {
+              const linhasIp = lerLinhasEventos();
+              await tratarMidia(numeroProcesso, linhasIp, { prefixoExtra: `IP_${nomeSeguro(ip)}` });
+            }
+            // Autos do IP, com o número do PROCESSO PAI no nome — é o que
+            // permite saber, olhando a pasta de downloads, de que processo
+            // aquele inquérito veio: "<processo>__IP_<numeroIP>__AUTOS_PARTE_N.pdf".
+            if (opcoes.autos) {
+              entrarEmAutos(state, { numeroProcesso, ip, voltarPara: 'apos_autos_ip' });
+              continue;
+            }
           }
 
+          state.fase = 'apos_autos_ip';
+          saveState(state);
+          continue;
+        }
+
+        if (state.fase === 'apos_autos_ip') {
+          const numeroProcesso = state.processoAtual;
+          const item = state.fila.find((p) => p.numero === numeroProcesso);
           const proximoIndice = state.ipIndiceAtual + 1;
           if (proximoIndice < item.ip.length) {
             const caixaBusca = findSearchBox();
