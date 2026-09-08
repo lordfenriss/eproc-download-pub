@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dossiês de Audiência — Downloader de Autos do eproc
 // @namespace    dossies-audiencia-download
-// @version      0.4.0
+// @version      0.5.0
 // @description  Automatiza busca, identificação de denúncia/IP/mídia e download de autos do eproc para dossiês de audiência. Ver README e docs/DECISOES.md deste repositório para o escopo da v1.
 // @author       lordfenriss
 // @homepageURL  https://github.com/lordfenriss/eproc-download-pub
@@ -77,9 +77,27 @@
       // carregarTodosOsEventos() clica nesse link em loop até ele sumir.
       carregarProximaPagina: 'Carregar os eventos da próxima página',
       inqueritoPolicial: 'INQUÉRITO POLICIAL',
-      checkboxListaEventos: 'Adicionar lista com todos os eventos incluídos no download na capa do processo',
-      checkboxAnexosEletronicos: 'Incluir anexos eletrônicos',
-      checkboxSoComDocumentos: 'Trazer só eventos com documentos',
+      // LISTAS, não textos únicos: o rótulo completo vem do Manual, mas a
+      // tela real pode escrever diferente. Cada entrada é tentada em ordem,
+      // da mais específica para a mais curta, com comparação sem acento e sem
+      // caixa (ver normalizar()). Só o primeiro que casar é usado, e uma
+      // checkbox já usada por outra opção não é reaproveitada.
+      checkboxListaEventos: [
+        'Adicionar lista com todos os eventos incluídos no download na capa do processo',
+        'lista com todos os eventos',
+        'lista de eventos',
+      ],
+      checkboxAnexosEletronicos: [
+        'Incluir anexos eletrônicos',
+        'anexos eletrônicos',
+        'anexos',
+      ],
+      checkboxSoComDocumentos: [
+        'Trazer só eventos com documentos',
+        'só eventos com documentos',
+        'somente eventos com documentos',
+        'eventos com documentos',
+      ],
     },
     // Sinais de que os primeiros eventos indicam processo migrado de outro sistema
     // (PJe), usados só quando a busca direta por DENUNCIA/DENÚNCIA falha.
@@ -129,22 +147,60 @@
     // ------------------------------------------------------------------
     downloadCompleto: {
       // O que fazer com cada checkbox da tela de opções.
-      //   null  = NÃO MEXER (usa o que o eproc já traz marcado) — padrão
+      //   null  = NÃO MEXER (usa o que o eproc já traz marcado)
       //   true  = forçar marcada
       //   false = forçar desmarcada
-      // Padrão conservador: não mexer em nada e só REGISTRAR NO LOG o estado
-      // de cada uma. Mexer às cegas no que o eproc já traz pode mudar o
-      // conteúdo do PDF sem ninguém perceber. Depois do primeiro download
-      // real, ajuste aqui conforme o Manual.
+      //
+      // DECIDIDO em 08/09/2026 pelo usuário, depois de ver a tela real: o
+      // eproc traz as três DESMARCADAS e as três precisam estar MARCADAS.
+      // Até a v0.4.0 a política era "não mexer" porque ninguém tinha visto a
+      // tela — o download saía sem a lista de eventos e sem os anexos.
+      // O log continua registrando como cada uma veio, para se saber se o
+      // padrão do eproc mudou.
       checkboxes: {
-        listaEventos: null,
-        anexosEletronicos: null,
-        soComDocumentos: null,
+        listaEventos: true,
+        anexosEletronicos: true,
+        soComDocumentos: true,
       },
       // Quantas partes no máximo procurar numa tela (trava de segurança).
       maxPartes: 50,
       // Tempo máximo esperando a tela de opções aparecer depois do clique.
       timeoutTelaMs: 30000,
+    },
+    // ------------------------------------------------------------------
+    // Resolução do link de documento (v0.5.0).
+    //
+    // Achado do teste real (08/09/2026): o href do evento
+    // ("controlador.php?acao=acessar_documento&...") NÃO é o arquivo — é uma
+    // página intermediária. Dependendo de como o Chrome está configurado para
+    // PDF, ela embute o visualizador (iframe/embed apontando para o arquivo
+    // de verdade) ou mostra só um botão "Abrir". Passar esse href direto ao
+    // GM_download baixa a página (.htm) ou falha com "not_succeeded" — foi
+    // exatamente o que aconteceu com o INIC1 do Evento 1.
+    // ------------------------------------------------------------------
+    documento: {
+      // Quantas páginas intermediárias seguir antes de desistir.
+      maxNiveis: 3,
+      // Ação do controlador que costuma servir o conteúdo em si. Usada só
+      // para PRIORIZAR candidatos achados no HTML — nunca para inventar URL.
+      acoesDeConteudo: /acessar_documento_implementacao|acao=download|\.pdf(\?|$)/i,
+      // Textos de link que, na página intermediária, levam ao arquivo.
+      textosDeAbertura: /^(abrir|baixar|download|visualizar|clique aqui)\b/i,
+    },
+    // ------------------------------------------------------------------
+    // Modo multi-aba (v0.5.0) — ver o bloco grande de comentário perto de
+    // supervisionar(), no fim do arquivo.
+    // ------------------------------------------------------------------
+    multiAba: {
+      maxAbasSimultaneas: 4,      // padrão; o painel sobrepõe (opcoes.maxAbas)
+      atrasoEntreAberturasMs: 800, // respiro entre window.open, para não parecer rajada
+      intervaloSupervisaoMs: 4000,
+      // Uma aba que não dá sinal de vida por este tempo é considerada travada:
+      // o item vira "erro" e a vaga é liberada para o próximo da fila.
+      timeoutSemSinalMs: 25 * 60 * 1000,
+      // Quanto a aba espera antes de se fechar, para dar tempo de um download
+      // pela via alternativa (blob) terminar de ser gravado.
+      atrasoParaFecharMs: 15000,
     },
     mediaMinBytes: 20 * 1024, // abaixo disso e sem Content-Type de mídia, é suspeito (ver docs/DECISOES.md, ponto 6)
     limiteFontesNotebookLM: 50,
@@ -163,7 +219,14 @@
   // desses passos.
   function loadOpcoes() {
     return Object.assign(
-      { autos: true, denuncia: true, midia: true, ips: true },
+      {
+        autos: true,
+        denuncia: true,
+        midia: true,
+        ips: true,
+        maxAbas: CONFIG.multiAba.maxAbasSimultaneas,
+        fecharAba: true,
+      },
       GM_getValue(OPCOES_KEY, {})
     );
   }
@@ -189,32 +252,121 @@
   // Achado do teste real (03/09/2026): a busca por número NAVEGA a página
   // inteira (confirmado pelo usuário — a tela pisca e recarrega), então o
   // fluxo de processamento não pode ser uma função só com `await` no meio:
-  // cada navegação descarta o contexto JS em execução. `avancarFila()` (perto
-  // do fim do arquivo) é chamada tanto pelo botão "Iniciar" quanto de novo, do
-  // zero, a cada carregamento de página — e usa só o que está aqui no estado
-  // persistido para saber onde retomar.
+  // cada navegação descarta o contexto JS em execução. `avancarAba()` (perto
+  // do fim do arquivo) é chamada de novo, do zero, a cada carregamento de
+  // página — e usa só o que está persistido para saber onde retomar.
+  //
+  // A PARTIR DA v0.5.0 o estado é dividido em dois:
+  //
+  //   ESTADO GLOBAL (GM_setValue, abaixo) — a FILA: um item por processo e um
+  //   por inquérito referenciado, com o status de cada um. É compartilhado por
+  //   TODAS as abas: a aba coordenadora lê para saber o que abrir, e cada aba
+  //   de trabalho escreve nele o seu resultado.
+  //
+  //   ESTADO DA ABA (sessionStorage, ver loadTarefa) — "qual é a minha tarefa
+  //   e em que passo estou". sessionStorage é POR ABA, que é exatamente o que
+  //   torna possível ter nove processos rodando ao mesmo tempo sem um
+  //   atropelar o passo do outro. Sobrevive à navegação da busca dentro da
+  //   própria aba, que é o motivo de o estado existir desde a v0.2.0.
   function newState(processos) {
     return {
-      fila: processos.map((numero) => ({
-        numero,
-        status: 'pendente', // pendente | em_andamento | concluido | erro | pulado
-        ip: [], // números de IP referenciados encontrados
-        observacao: '',
-      })),
-      // ocioso | aguardando_busca_principal | aguardando_busca_ip
-      fase: 'ocioso',
-      processoAtual: null, // numero do item da fila em andamento (mesmo durante a subfase de IP)
-      ipIndiceAtual: 0, // índice em item.ip sendo processado, quando fase === 'aguardando_busca_ip'
+      fila: processos.map((numero) => itemDeFila(numero, 'processo', null)),
       pausado: false, // true depois de clicar "Parar" — impede retomada automática na próxima carga
     };
   }
 
+  function itemDeFila(numero, tipo, processoPai) {
+    return {
+      numero,
+      tipo, // 'processo' | 'ip'
+      processoPai: processoPai || null, // preenchido só nos itens de IP
+      status: 'pendente', // pendente | em_andamento | concluido | erro
+      observacao: '',
+      ultimoSinal: null, // ms; a aba que está com o item atualiza de tempos em tempos
+    };
+  }
+
+  function mesmoItem(a, b) {
+    return a.numero === b.numero && (a.tipo || 'processo') === (b.tipo || 'processo')
+      && (a.processoPai || null) === (b.processoPai || null);
+  }
+  function acharItem(state, alvo) {
+    return state && state.fila ? state.fila.find((p) => mesmoItem(p, alvo)) || null : null;
+  }
+  function rotuloItem(item) {
+    return item.tipo === 'ip' ? `${item.processoPai} (IP ${item.numero})` : item.numero;
+  }
+
+  // ----------------------------------------------------------------------
+  // Tarefa desta aba — sessionStorage, e não GM_setValue, de propósito:
+  // GM_setValue é global (todas as abas veem o mesmo valor) e sessionStorage
+  // é por aba. É a única peça que permite N abas trabalhando em paralelo.
+  //
+  // ATENÇÃO ao clone: o Chrome COPIA o sessionStorage da aba de origem para a
+  // aba nova aberta por window.open. Por isso adotarTarefaDaUrl() sempre
+  // sobrescreve o que veio clonado, e apaga a marca de coordenadora.
+  // ----------------------------------------------------------------------
+  const TAREFA_KEY = 'eprocDownloaderTarefaAba_v1';
+  const COORDENADORA_KEY = 'eprocDownloaderCoordenadora_v1';
+
+  function loadTarefa() {
+    try {
+      return JSON.parse(sessionStorage.getItem(TAREFA_KEY) || 'null');
+    } catch (e) {
+      return null;
+    }
+  }
+  function saveTarefa(tarefa) {
+    try {
+      sessionStorage.setItem(TAREFA_KEY, JSON.stringify(tarefa));
+    } catch (e) {
+      log(`sessionStorage indisponível nesta aba (${e.message}) — o modo multi-aba não funciona sem ele.`, 'erro');
+    }
+  }
+  function clearTarefa() {
+    try {
+      sessionStorage.removeItem(TAREFA_KEY);
+    } catch (e) { /* nada a fazer */ }
+  }
+  function rotuloTarefa(tarefa) {
+    if (tarefa.tipo === 'ip') return `${tarefa.processoPai} (IP ${tarefa.numero})`;
+    return tarefa.numero;
+  }
+  function ehCoordenadora() {
+    try {
+      return sessionStorage.getItem(COORDENADORA_KEY) === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+  function marcarComoCoordenadora() {
+    try {
+      sessionStorage.setItem(COORDENADORA_KEY, '1');
+    } catch (e) { /* nada a fazer */ }
+  }
+
+  // Teto do log guardado. Com o modo multi-aba, N abas escrevem no MESMO log
+  // (GM_setValue é global) e cada escrita relê e regrava a lista inteira —
+  // sem teto, um lote grande vira uma lista de milhares de itens sendo
+  // reserializada a cada linha.
+  const LOG_MAX = 600;
+
   function log(mensagem, nivel = 'info') {
+    // Com várias abas escrevendo no mesmo log, saber DE QUEM é cada linha é o
+    // que torna o log legível. As mensagens que já começam pelo número do
+    // processo (a maioria) não ganham prefixo repetido.
+    const prefixo = prefixoDaAba();
+    const texto = prefixo && !String(mensagem).startsWith(prefixo) ? `${prefixo}: ${mensagem}` : String(mensagem);
     const entradas = GM_getValue(LOG_KEY, []);
-    entradas.push({ ts: new Date().toISOString(), nivel, mensagem });
-    GM_setValue(LOG_KEY, entradas);
-    console.log(`[eproc-downloader] [${nivel}] ${mensagem}`);
+    entradas.push({ ts: new Date().toISOString(), nivel, mensagem: texto });
+    GM_setValue(LOG_KEY, entradas.length > LOG_MAX ? entradas.slice(-LOG_MAX) : entradas);
+    console.log(`[eproc-downloader] [${nivel}] ${texto}`);
     renderLog();
+  }
+
+  function prefixoDaAba() {
+    const tarefa = loadTarefa();
+    return tarefa ? rotuloTarefa(tarefa) : '';
   }
   function getLog() {
     return GM_getValue(LOG_KEY, []);
@@ -257,8 +409,60 @@
     return null;
   }
 
+  // sleep() por Web Worker, e não por setTimeout direto.
+  //
+  // POR QUE: o Chrome estrangula os temporizadores de abas em SEGUNDO PLANO —
+  // depois de alguns minutos, um setTimeout pode só disparar 1x por minuto.
+  // Já era um problema com uma aba só (ver docs/LIMITACOES.md, "Aba em segundo
+  // plano"); com o modo multi-aba da v0.5.0, onde N-1 abas estão sempre em
+  // segundo plano, seria fatal: uma espera de 15s viraria 60s e o "Gerar
+  // Arquivo Completo" nunca seria detectado a tempo. Temporizador dentro de um
+  // Worker dedicado NÃO sofre esse estrangulamento.
+  //
+  // Se a política de segurança da página proibir Worker via blob:, cai
+  // silenciosamente no setTimeout de sempre — mais lento em segundo plano,
+  // mas funcional.
+  let timerWorker;           // undefined = ainda não tentou; null = indisponível
+  let timerSeq = 0;
+  const timerPendentes = new Map();
+  function obterTimerWorker() {
+    if (timerWorker !== undefined) return timerWorker;
+    try {
+      const fonte = 'onmessage=function(e){setTimeout(function(){postMessage(e.data.id);},e.data.ms);};';
+      const w = new Worker(URL.createObjectURL(new Blob([fonte], { type: 'application/javascript' })));
+      w.onmessage = (ev) => {
+        const resolver = timerPendentes.get(ev.data);
+        if (resolver) {
+          timerPendentes.delete(ev.data);
+          resolver();
+        }
+      };
+      timerWorker = w;
+    } catch (e) {
+      timerWorker = null;
+    }
+    return timerWorker;
+  }
   function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    const w = obterTimerWorker();
+    if (!w) return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise((resolve) => {
+      const id = ++timerSeq;
+      timerPendentes.set(id, resolve);
+      w.postMessage({ id, ms });
+    });
+  }
+
+  // Comparação de texto insensível a acento, caixa e espaço repetido. O eproc
+  // escreve "anexos eletrônicos" numa tela e "Anexos Eletronicos" em outra;
+  // casar por texto exato é o que faz um passo "sumir" sem explicação.
+  function normalizar(s) {
+    return (s || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
   }
 
   // Espera até um seletor aparecer na página (poll simples) — usado depois da
@@ -511,17 +715,224 @@
   // primeiro arquivo baixado por essa rota realmente abre e não é uma
   // página de login/erro antes de confiar no lote inteiro.
   // ======================================================================
-  function baixarComoArquivo(href, nomeArquivo) {
+  function gmDownload(url, nomeArquivo) {
     return new Promise((resolve, reject) => {
       GM_download({
-        url: href,
+        url,
         name: nomeArquivo, // barra "/" não cria subpasta real — nunca usar aqui (achado do Manual, 14/08/2026)
         saveAs: false,
         onload: () => resolve({}),
-        onerror: (detalhe) => reject(new Error(`GM_download falhou em ${href}: ${detalhe?.error || JSON.stringify(detalhe)}`)),
-        ontimeout: () => reject(new Error(`GM_download expirou (timeout) em ${href}`)),
+        onerror: (detalhe) => reject(new Error(`GM_download falhou (${(detalhe && detalhe.error) || JSON.stringify(detalhe)})`)),
+        ontimeout: () => reject(new Error('GM_download expirou (timeout)')),
       });
     });
+  }
+
+  function pareceHtml(contentType) {
+    return /text\/html|application\/xhtml/i.test(contentType || '');
+  }
+
+  // ----------------------------------------------------------------------
+  // O LINK DO EVENTO NÃO É O ARQUIVO. (Achado do teste real, 08/09/2026.)
+  //
+  // "controlador.php?acao=acessar_documento&..." devolve HTML. Conforme a
+  // configuração do Chrome para PDF, essa página ou embute o visualizador
+  // (iframe/embed apontando para o arquivo de verdade) ou mostra só um botão
+  // "Abrir". Foi por isso que o download do INIC1 do Evento 1 ora salvava um
+  // ".htm", ora falhava com "not_succeeded": o GM_download estava recebendo o
+  // endereço da SALA DE ESPERA, não o do documento.
+  //
+  // Daí este resolvedor. Ele NUNCA inventa URL: busca a página, lê o
+  // Content-Type e, se for HTML, procura dentro dela os endereços que ela
+  // mesma aponta. Se não achar nada, baixa um diagnóstico com o HTML — a
+  // mesma política do resto do script (transformar "não funcionou" em dado
+  // acionável na primeira rodada, e não na terceira).
+  // ----------------------------------------------------------------------
+
+  // Só os cabeçalhos, sem trazer o corpo. Serve para dois propósitos: saber se
+  // a URL já é o arquivo, e medir o tamanho da mídia sem baixá-la.
+  async function inspecionarCabecalhos(url) {
+    try {
+      const r = await fetch(url, { method: 'HEAD', credentials: 'include', redirect: 'follow' });
+      if (!r.ok && r.status !== 304) return null;
+      const tamanho = r.headers.get('Content-Length');
+      return {
+        contentType: r.headers.get('Content-Type') || '',
+        urlFinal: r.url || url,
+        bytes: tamanho ? parseInt(tamanho, 10) : null,
+      };
+    } catch (e) {
+      return null; // servidor pode não aceitar HEAD — quem chama cai para GET
+    }
+  }
+
+  // Endereços de arquivo que a página intermediária aponta, do mais provável
+  // para o menos. Cobre as formas que o eproc pode usar: visualizador
+  // embutido, botão "Abrir", redirecionamento por meta/JS, e URLs do próprio
+  // controlador escritas no meio do HTML.
+  function candidatosDeArquivo(html, urlBase) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const achados = [];
+    const push = (bruto, via) => {
+      if (!bruto) return;
+      const limpo = String(bruto).replace(/&amp;/g, '&').trim();
+      if (!limpo || /^(javascript:|#|about:|mailto:)/i.test(limpo)) return;
+      let abs;
+      try {
+        abs = new URL(limpo, urlBase).href;
+      } catch (e) {
+        return;
+      }
+      if (abs.split('#')[0] === urlBase.split('#')[0]) return; // ele mesmo
+      achados.push({ url: abs, via });
+    };
+
+    for (const el of doc.querySelectorAll('iframe[src], embed[src], frame[src]')) push(el.getAttribute('src'), el.tagName.toLowerCase());
+    for (const el of doc.querySelectorAll('object[data]')) push(el.getAttribute('data'), 'object');
+    for (const a of doc.querySelectorAll('a[href]')) {
+      const texto = (a.textContent || '').replace(/\s+/g, ' ').trim();
+      if (CONFIG.documento.textosDeAbertura.test(normalizar(texto))) push(a.getAttribute('href'), `link "${texto.slice(0, 30)}"`);
+    }
+    for (const b of doc.querySelectorAll('button[onclick], input[onclick]')) {
+      const m = (b.getAttribute('onclick') || '').match(/['"]([^'"]+controlador\.php[^'"]*)['"]/i);
+      if (m) push(m[1], 'onclick de botão');
+    }
+    const meta = doc.querySelector('meta[http-equiv="refresh" i]');
+    if (meta) {
+      const m = (meta.getAttribute('content') || '').match(/url\s*=\s*['"]?([^'";]+)/i);
+      if (m) push(m[1], 'meta refresh');
+    }
+    for (const f of doc.querySelectorAll('form[action]')) push(f.getAttribute('action'), 'action de formulário');
+    for (const m of html.matchAll(/(?:location(?:\.href)?\s*=|window\.open\s*\(|\.src\s*=)\s*['"]([^'"]+)['"]/gi)) {
+      push(m[1], 'redirecionamento em javascript');
+    }
+    for (const m of html.matchAll(/((?:https?:\/\/[^"'\s)<>]+)?controlador\.php\?[^"'\s)<>]+)/gi)) {
+      push(m[1], 'controlador.php citado no HTML');
+    }
+
+    const unicos = achados.filter((c, i) => achados.findIndex((o) => o.url === c.url) === i);
+    // O que tem cara de conteúdo (acessar_documento_implementacao, .pdf...) vem antes.
+    return unicos.sort(
+      (a, b) => (CONFIG.documento.acoesDeConteudo.test(a.url) ? 0 : 1) - (CONFIG.documento.acoesDeConteudo.test(b.url) ? 0 : 1)
+    );
+  }
+
+  // Devolve { url, contentType, bytes, trilha, html, aviso }.
+  // `url` null = não deu para chegar ao arquivo; `trilha` conta o caminho
+  // percorrido e vai inteira para o diagnóstico.
+  async function resolverUrlDocumento(href) {
+    let url = href;
+    const trilha = [];
+    for (let nivel = 0; nivel < CONFIG.documento.maxNiveis; nivel++) {
+      // 1) HEAD primeiro: se já é o arquivo, terminamos sem trazer o corpo —
+      //    o que importa muito para mídia, que pode ter centenas de MB.
+      const cabecalhos = await inspecionarCabecalhos(url);
+      if (cabecalhos && !pareceHtml(cabecalhos.contentType)) {
+        trilha.push(`${cabecalhos.urlFinal} -> ${cabecalhos.contentType || '(sem Content-Type)'} [HEAD]`);
+        return { url: cabecalhos.urlFinal, contentType: cabecalhos.contentType, bytes: cabecalhos.bytes, trilha, html: null, aviso: null };
+      }
+
+      // 2) É HTML (ou o servidor não aceita HEAD): traz o corpo para ler os
+      //    endereços que a própria página aponta. Aborta assim que os
+      //    cabeçalhos mostrarem que não é HTML, para não puxar um vídeo inteiro.
+      const controle = new AbortController();
+      let resposta;
+      try {
+        resposta = await fetch(url, { credentials: 'include', redirect: 'follow', signal: controle.signal });
+      } catch (e) {
+        trilha.push(`${url} -> falha de rede: ${e.message}`);
+        return { url: null, contentType: null, bytes: null, trilha, html: null, aviso: `não deu para abrir a URL do documento (${e.message}).` };
+      }
+      const tipo = resposta.headers.get('Content-Type') || '';
+      const urlFinal = resposta.url || url;
+      trilha.push(`${urlFinal} -> ${resposta.status} ${tipo || '(sem Content-Type)'}`);
+      if (!pareceHtml(tipo)) {
+        controle.abort();
+        const tamanho = resposta.headers.get('Content-Length');
+        return { url: urlFinal, contentType: tipo, bytes: tamanho ? parseInt(tamanho, 10) : null, trilha, html: null, aviso: null };
+      }
+
+      const html = await resposta.text();
+      if (html.length < 30000 && /acesso negado|sess[aã]o expirad|informe seu login|autentica[cç][aã]o/i.test(html)) {
+        return { url: null, contentType: tipo, bytes: null, trilha, html, aviso: 'a resposta parece tela de login / acesso negado — a sessão do eproc pode ter expirado. Recarregue o eproc, confirme que está logado e tente de novo.' };
+      }
+      const candidatos = candidatosDeArquivo(html, urlFinal);
+      if (candidatos.length === 0) {
+        return { url: null, contentType: tipo, bytes: null, trilha, html, aviso: 'a página intermediária foi lida, mas nenhum endereço de arquivo foi encontrado dentro dela.' };
+      }
+      trilha.push(`  candidato escolhido (${candidatos[0].via}): ${candidatos[0].url}`);
+      for (const c of candidatos.slice(1, 6)) trilha.push(`  (descartado) ${c.via}: ${c.url}`);
+      url = candidatos[0].url;
+    }
+    return { url, contentType: null, bytes: null, trilha, html: null, aviso: `foram seguidas ${CONFIG.documento.maxNiveis} páginas intermediárias sem chegar a um arquivo — baixando o último endereço mesmo assim.` };
+  }
+
+  // Diagnóstico específico de documento: é o que diz, numa rodada, qual é a
+  // forma real da página intermediária deste tribunal.
+  function diagnosticoDocumento(href, resultado, rotulo) {
+    const linhas = [];
+    linhas.push('=== DIAGNÓSTICO DE DOCUMENTO — eproc-downloader ===');
+    linhas.push(`Data: ${new Date().toISOString()}`);
+    linhas.push(`Rótulo/arquivo: ${rotulo}`);
+    linhas.push(`URL do link do evento: ${href}`);
+    linhas.push(`Resultado: ${resultado.aviso || 'sem aviso'}`);
+    linhas.push('');
+    linhas.push('--- Caminho percorrido ---');
+    for (const t of resultado.trilha || []) linhas.push(`  ${t}`);
+    if (resultado.html) {
+      linhas.push('');
+      linhas.push('--- HTML da página intermediária (primeiros 6000 caracteres) ---');
+      linhas.push(resultado.html.slice(0, 6000));
+    }
+    return finalizarDiagnostico(linhas, 'eproc-diagnostico-documento');
+  }
+
+  // Baixa um documento do eproc. `href` é o link do evento (página
+  // intermediária) — a resolução para o arquivo real é feita aqui dentro.
+  // Passe { resolver: false } quando a URL JÁ é o arquivo.
+  async function baixarComoArquivo(href, nomeArquivo, { resolver = true } = {}) {
+    let url = href;
+    if (resolver) {
+      const r = await resolverUrlDocumento(href);
+      if (!r.url) {
+        diagnosticoDocumento(href, r, nomeArquivo);
+        throw new Error(`não foi possível chegar ao arquivo de ${nomeArquivo}: ${r.aviso} Um "eproc-diagnostico-documento-*.txt" foi baixado — mande esse arquivo na conversa.`);
+      }
+      if (r.aviso) log(`${nomeArquivo}: ${r.aviso}`, 'aviso');
+      if (r.url !== href) {
+        log(`${nomeArquivo}: o link do evento era página intermediária; arquivo real em ${r.url.slice(0, 140)}${r.url.length > 140 ? '…' : ''} (${r.contentType || 'tipo desconhecido'}).`);
+      }
+      url = r.url;
+    }
+    try {
+      await gmDownload(url, nomeArquivo);
+    } catch (e) {
+      // GM_download é a via preferida (ver comentário do bloco acima). Quando
+      // ela falha mesmo com a URL já resolvida, a via do blob ainda salva o
+      // arquivo — ao custo de o Chrome poder pedir permissão de "baixar vários
+      // arquivos". Melhor pedir permissão do que perder o documento.
+      log(`${nomeArquivo}: ${e.message}. Tentando pela via alternativa (fetch + blob).`, 'aviso');
+      await baixarPorBlob(url, nomeArquivo);
+    }
+  }
+
+  async function baixarPorBlob(url, nomeArquivo) {
+    const resposta = await fetch(url, { credentials: 'include' });
+    if (!resposta.ok) throw new Error(`servidor respondeu ${resposta.status} ao baixar ${nomeArquivo}.`);
+    const tipo = resposta.headers.get('Content-Type') || '';
+    const blob = await resposta.blob();
+    if (pareceHtml(tipo)) {
+      throw new Error(`o que chegou em ${nomeArquivo} é HTML (${blob.size} bytes), não um arquivo — NÃO foi salvo. Confira se a sessão do eproc ainda está aberta.`);
+    }
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objUrl;
+    a.download = nomeArquivo;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 60000);
+    log(`${nomeArquivo}: baixado pela via alternativa (${blob.size} bytes, ${tipo || 'tipo desconhecido'}). Se o Chrome perguntar sobre "baixar vários arquivos", clique em Permitir.`, 'aviso');
   }
 
   function nomeSeguro(s) {
@@ -553,17 +964,22 @@
   // mais curta: numa tela com "BAIXAR ARQUIVO" e "BAIXAR ARQUIVO PARTE 1",
   // procurar "BAIXAR ARQUIVO" tem de achar o primeiro, não o segundo.
   function acharControle(texto, { raiz = document, visivel = true } = {}) {
-    const alvo = texto.toLowerCase();
-    const candidatos = controlesClicaveis(raiz)
-      .filter((el) => textoDeControle(el).toLowerCase().includes(alvo))
-      .filter((el) => !visivel || el.offsetParent !== null || el.getClientRects().length > 0)
-      .sort((a, b) => textoDeControle(a).length - textoDeControle(b).length);
-    return candidatos[0] || null;
+    for (const alvo of [].concat(texto).map(normalizar)) {
+      const candidatos = controlesClicaveis(raiz)
+        .filter((el) => normalizar(textoDeControle(el)).includes(alvo))
+        .filter((el) => !visivel || el.offsetParent !== null || el.getClientRects().length > 0)
+        .sort((a, b) => textoDeControle(a).length - textoDeControle(b).length);
+      if (candidatos.length) return candidatos[0];
+    }
+    return null;
   }
 
   function acharTodosControles(texto, { raiz = document } = {}) {
-    const alvo = texto.toLowerCase();
-    return controlesClicaveis(raiz).filter((el) => textoDeControle(el).toLowerCase().includes(alvo));
+    for (const alvo of [].concat(texto).map(normalizar)) {
+      const achados = controlesClicaveis(raiz).filter((el) => normalizar(textoDeControle(el)).includes(alvo));
+      if (achados.length) return achados;
+    }
+    return [];
   }
 
   // Espera um controle com esse texto aparecer (a tela do eproc pode demorar
@@ -578,21 +994,34 @@
     return null;
   }
 
-  // Checkbox pelo texto do <label> associado (ou do texto ao redor).
-  function acharCheckboxPorTexto(texto) {
-    const alvo = texto.toLowerCase().slice(0, 60);
-    for (const input of document.querySelectorAll('input[type="checkbox"]')) {
-      const rotuloDoFor = input.id ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`) : null;
-      const contexto = [
-        rotuloDoFor && rotuloDoFor.textContent,
-        input.closest('label') && input.closest('label').textContent,
-        input.parentElement && input.parentElement.textContent,
-      ]
-        .filter(Boolean)
-        .join(' ')
-        .replace(/\s+/g, ' ')
-        .toLowerCase();
-      if (contexto.includes(alvo)) return input;
+  // Texto que identifica uma checkbox: o <label for=...>, o <label> que a
+  // envolve, o irmão seguinte e o texto do elemento-pai — nessa ordem de
+  // confiança. O eproc usa formas diferentes de tela para tela.
+  function contextoDaCheckbox(input) {
+    const rotuloDoFor = input.id ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`) : null;
+    return [
+      rotuloDoFor && rotuloDoFor.textContent,
+      input.closest('label') && input.closest('label').textContent,
+      input.nextElementSibling && input.nextElementSibling.textContent,
+      input.parentElement && input.parentElement.textContent,
+      input.getAttribute('aria-label'),
+      input.getAttribute('title'),
+    ]
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  // Checkbox pelo texto ao redor. `texto` pode ser uma lista de variantes,
+  // tentadas em ordem; `ignorar` evita que duas opções diferentes casem com a
+  // mesma checkbox (o rótulo curto de uma pode estar contido no da outra).
+  function acharCheckboxPorTexto(texto, { ignorar = [] } = {}) {
+    const variantes = [].concat(texto).map((t) => normalizar(t).slice(0, 70));
+    for (const alvo of variantes) {
+      if (!alvo) continue;
+      for (const input of document.querySelectorAll('input[type="checkbox"]')) {
+        if (ignorar.includes(input)) continue;
+        if (normalizar(contextoDaCheckbox(input)).includes(alvo)) return input;
+      }
     }
     return null;
   }
@@ -664,7 +1093,7 @@
   // `prefixo` já vem pronto ("<processo>" ou "<processo>__IP_<numero>"), e
   // a convenção de nome é a de docs/DECISOES.md, lida depois pelo organizador.
   // ----------------------------------------------------------------------
-  async function baixarPartesDosAutos(prefixo, { numeroProcesso, ip = null } = {}) {
+  async function baixarPartesDosAutos(prefixo, { numeroProcesso, ip = null, jaFeitas = [], aoBaixar = () => {} } = {}) {
     // "BAIXAR ARQUIVO PARTE 1", "BAIXAR ARQUIVO PARTE 2"... ou, quando o
     // documento coube num arquivo só, um único "BAIXAR ARQUIVO".
     let botoes = acharTodosControles(CONFIG.labels.baixarArquivoParte);
@@ -689,11 +1118,14 @@
     // virar PARTE_10 por acidente de ordem no DOM.
     botoes.sort((a, b) => numeroDaParte(a) - numeroDaParte(b));
 
+    log(`${numeroProcesso}: ${botoes.length} ${temPartes ? 'parte(s)' : 'arquivo'} para baixar${jaFeitas.length ? ` (${jaFeitas.length} já baixada(s) antes desta aba recarregar)` : ''}.`);
+
     let baixadas = 0;
     let viaClique = 0;
     for (let i = 0; i < botoes.length; i++) {
       const botao = botoes[i];
       const parte = temPartes ? numeroDaParte(botao) || i + 1 : 1;
+      if (jaFeitas.includes(parte)) continue;
       const nome = temPartes
         ? `${prefixo}__AUTOS_PARTE_${parte}.pdf`
         : `${prefixo}__AUTOS.pdf`;
@@ -705,6 +1137,7 @@
           await baixarComoArquivo(href, nome);
           registrarNoManifesto({ processo: numeroProcesso, ip, rotulo: textoDeControle(botao), nomeArquivo: nome, viaClique: false });
           baixadas += 1;
+          aoBaixar(parte);
           log(`${numeroProcesso}: autos — ${nome} baixado.`);
         } catch (e) {
           log(`${numeroProcesso}: falha ao baixar ${nome}: ${e && e.message ? e.message : e}`, 'erro');
@@ -713,8 +1146,12 @@
         // Sem href utilizável: só resta clicar, e quem nomeia é o eproc. O
         // manifesto guarda o instante do clique para o organizador casar
         // depois pelo horário do arquivo.
-        botao.click();
+        // Registrar ANTES do clique: se ele navegar a página, esta aba morre
+        // aqui e retoma em 'baixando' — a parte já contada não é baixada duas
+        // vezes (ver autos.partesFeitas).
         registrarNoManifesto({ processo: numeroProcesso, ip, rotulo: textoDeControle(botao), nomeArquivo: nome, viaClique: true });
+        aoBaixar(parte);
+        botao.click();
         viaClique += 1;
         baixadas += 1;
         log(`${numeroProcesso}: autos — parte ${parte} baixada por clique (o eproc é quem nomeia o arquivo; o manifesto registra que ela é deste processo${ip ? `, IP ${ip}` : ''}).`, 'aviso');
@@ -741,25 +1178,41 @@
       ['soComDocumentos', CONFIG.labels.checkboxSoComDocumentos],
     ];
     const relato = [];
+    const usadas = [];
+    let faltando = 0;
     for (const [chave, rotulo] of mapa) {
-      const input = acharCheckboxPorTexto(rotulo);
+      const input = acharCheckboxPorTexto(rotulo, { ignorar: usadas });
       if (!input) {
         relato.push(`${chave}=NÃO ENCONTRADA`);
+        faltando += 1;
         continue;
       }
+      usadas.push(input);
       const desejado = CONFIG.downloadCompleto.checkboxes[chave];
       if (desejado === null || desejado === undefined) {
         relato.push(`${chave}=${input.checked ? 'marcada' : 'desmarcada'} (mantida)`);
         continue;
       }
       if (input.checked !== desejado) {
+        // click() (e não input.checked = ...) de propósito: é o clique que
+        // dispara os onclick/onchange que o eproc pendura nessas checkboxes.
         input.click();
-        relato.push(`${chave}=${desejado ? 'marcada' : 'desmarcada'} (ALTERADA pelo script)`);
+        if (input.checked !== desejado) {
+          input.checked = desejado;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        relato.push(`${chave}=${input.checked ? 'marcada' : 'desmarcada'} (ALTERADA pelo script)`);
       } else {
         relato.push(`${chave}=${input.checked ? 'marcada' : 'desmarcada'} (já estava)`);
       }
     }
     log(`${numeroProcesso}: opções do Download Completo — ${relato.join(', ')}.`);
+    if (faltando > 0) {
+      // Sem isso o download sai silenciosamente sem a lista de eventos ou sem
+      // os anexos, e ninguém percebe até abrir o PDF.
+      log(`${numeroProcesso}: ${faltando} das 3 opções obrigatórias não foram encontradas na tela. Gerando diagnóstico de tela — mande o .txt para ajustar CONFIG.labels.checkbox*.`, 'erro');
+      diagnosticoTela(`checkbox(es) do Download Completo não encontrada(s) (${numeroProcesso})`);
+    }
   }
 
   // ======================================================================
@@ -817,6 +1270,7 @@
     const candidatos = linhasEventos.filter((l) => CONFIG.mediaRegex.test(l.rotulo));
 
     for (const c of candidatos) {
+      try {
       if (CONFIG.termoaudOnlyRegex.test(c.rotulo) && !/video|audio/i.test(c.rotulo)) {
         log(`${numeroProcesso}: evento "${c.rotulo}" é só TERMOAUD (termo de audiência em HTML) — não é mídia, ignorado.`);
         continue;
@@ -828,21 +1282,40 @@
         confiavel = true;
       }
 
-      let bytes = null;
+      // Resolver ANTES de checar cabeçalhos. Até a v0.4.0 o HEAD era feito no
+      // href do evento — que é a página intermediária e SEMPRE responde
+      // text/html. Ou seja: a checagem de "vídeo falso" reprovava toda mídia
+      // de verdade, e nada era baixado. Ver o bloco de resolverUrlDocumento().
+      let alvo = null;
       let tipo = null;
+      let bytes = null;
       try {
-        const resposta = await fetch(c.href, { method: 'HEAD', credentials: 'include' });
-        tipo = resposta.headers.get('Content-Type') || '';
-        const tamanho = resposta.headers.get('Content-Length');
-        bytes = tamanho ? parseInt(tamanho, 10) : null;
+        const r = await resolverUrlDocumento(c.href);
+        if (r.url) {
+          alvo = r.url;
+          tipo = r.contentType;
+          bytes = r.bytes;
+          if (bytes === null) {
+            const cab = await inspecionarCabecalhos(alvo);
+            if (cab) {
+              bytes = cab.bytes;
+              tipo = tipo || cab.contentType;
+            }
+          }
+        } else {
+          log(`${numeroProcesso}: não deu para chegar ao arquivo de "${c.rotulo}" — ${r.aviso}`, 'aviso');
+          diagnosticoDocumento(c.href, r, c.rotulo);
+          continue;
+        }
       } catch (e) {
-        log(`${numeroProcesso}: não foi possível checar cabeçalhos de "${c.rotulo}" antes de baixar (${e.message}).`, 'aviso');
+        log(`${numeroProcesso}: falha ao resolver o endereço de "${c.rotulo}" (${e.message}) — pulado.`, 'aviso');
+        continue;
       }
 
-      const pareceHtml = tipo && /text\/html/i.test(tipo);
+      const respostaEhHtml = pareceHtml(tipo);
       const pequenoDemais = bytes !== null && bytes < CONFIG.mediaMinBytes;
 
-      if (!confiavel && (pareceHtml || pequenoDemais)) {
+      if (!confiavel && (respostaEhHtml || pequenoDemais)) {
         log(`${numeroProcesso}: evento "${c.rotulo}" tem sinais de vídeo/áudio falso (tipo=${tipo || '?'}, ${bytes ?? '?'} bytes) — NÃO baixado. Confira manualmente (caso real já visto no Manual: "VIDEO1" era HTML de poucos KB).`, 'aviso');
         continue;
       }
@@ -850,8 +1323,14 @@
       const nomeFinal = nomeSugerido && CONFIG.mediaFilenamePattern.test(nomeSugerido)
         ? `${prefixo}__${nomeSugerido}`
         : `${prefixo}__${nomeSeguro(c.rotulo)}`;
-      await baixarComoArquivo(c.href, nomeFinal);
+      await baixarComoArquivo(alvo, nomeFinal, { resolver: false });
+      registrarNoManifesto({ processo: numeroProcesso, ip: null, rotulo: c.rotulo, nomeArquivo: nomeFinal, viaClique: false });
       log(`${numeroProcesso}: mídia "${c.rotulo}" baixada como ${nomeFinal} (${bytes !== null ? `${bytes} bytes` : 'tamanho desconhecido'}, ${tipo || 'tipo desconhecido'}).`);
+      } catch (e) {
+        // Uma mídia que falha não pode derrubar o processo inteiro: os AUTOS
+        // são o que importa no dia da audiência.
+        log(`${numeroProcesso}: falha ao baixar a mídia "${c.rotulo}" (${e && e.message ? e.message : e}) — seguindo para o próximo item.`, 'erro');
+      }
     }
   }
 
@@ -937,6 +1416,7 @@
         <button id="eproc-dl-exportar-log">Exportar log</button>
         <button id="eproc-dl-manifesto" title="Baixa o manifesto (.json) com o processo/IP de cada arquivo baixado — use com organizar_autos.py --manifesto">Manifesto</button>
         <button id="eproc-dl-diagnostico" title="Gera um relatório da estrutura da tabela de eventos desta página (.txt) para investigar seletores que não bateram">Diagnóstico</button>
+        <button id="eproc-dl-diag-doc" title="Segue o link de documento do Evento 1 e relata como se chega ao arquivo de verdade (.txt)">Diagnóstico doc.</button>
       </div>
       <div class="opcoes">
         <strong>Baixar:</strong>
@@ -944,6 +1424,12 @@
         <label><input type="checkbox" id="eproc-dl-opt-denuncia"> denúncia</label>
         <label><input type="checkbox" id="eproc-dl-opt-midia"> mídia</label>
         <label><input type="checkbox" id="eproc-dl-opt-ips"> IPs referenciados</label>
+        <div style="margin-top:5px;">
+          <label title="Quantos processos são baixados ao mesmo tempo, cada um na sua aba. O Chrome precisa permitir pop-ups para este site.">abas ao mesmo tempo:
+            <input type="number" id="eproc-dl-opt-maxabas" min="1" max="12" style="width:44px;">
+          </label>
+          <label title="Cada aba se fecha 5s depois de terminar o seu processo. O log fica guardado nesta aba principal."><input type="checkbox" id="eproc-dl-opt-fechar"> fechar aba ao terminar</label>
+        </div>
       </div>
       <div>
         <button id="eproc-dl-autos-agora" title="Roda o Download Completo no processo já aberto nesta página, sem depender da fila/CSV">Baixar autos desta página</button>
@@ -978,6 +1464,28 @@
       });
     }
 
+    // Opções numéricas/independentes das quatro caixas de "o que baixar".
+    const inputMaxAbas = document.getElementById('eproc-dl-opt-maxabas');
+    inputMaxAbas.value = loadOpcoes().maxAbas;
+    inputMaxAbas.addEventListener('change', () => {
+      const opcoes = loadOpcoes();
+      opcoes.maxAbas = Math.max(1, Math.min(12, Number(inputMaxAbas.value) || 1));
+      inputMaxAbas.value = opcoes.maxAbas;
+      saveOpcoes(opcoes);
+      log(`Abas simultâneas: ${opcoes.maxAbas}.`);
+    });
+    const inputFechar = document.getElementById('eproc-dl-opt-fechar');
+    inputFechar.checked = loadOpcoes().fecharAba;
+    inputFechar.addEventListener('change', () => {
+      const opcoes = loadOpcoes();
+      opcoes.fecharAba = inputFechar.checked;
+      saveOpcoes(opcoes);
+      log(`Fechar aba ao terminar: ${inputFechar.checked ? 'sim' : 'não'}.`);
+    });
+
+    document.getElementById('eproc-dl-diag-doc').addEventListener('click', () => {
+      diagnosticoDocumentoDaPagina().catch((e) => log(`Diagnóstico de documento falhou: ${e && e.message ? e.message : e}`, 'erro'));
+    });
     document.getElementById('eproc-dl-diagnostico').addEventListener('click', () => {
       log('Rodando diagnóstico da tabela de eventos (isso carrega todas as páginas de eventos e pode demorar)...');
       diagnosticoTabelaEventos().catch((e) => log(`Diagnóstico falhou: ${e && e.message ? e.message : e}`, 'erro'));
@@ -992,7 +1500,7 @@
     renderStatus();
   }
 
-  // Painel fechado não interrompe o processamento (avancarFila roda independente
+  // Painel fechado não interrompe o processamento (avancarAba roda independente
   // de UI) — só some da tela. Este botão fica sozinho, sem o resto do painel,
   // pra sempre dar um jeito visível de voltar a abrir.
   function criarBotaoReabrir() {
@@ -1192,14 +1700,23 @@
     const el = document.getElementById('eproc-dl-status');
     if (!el) return;
     const state = loadState();
-    if (!state) {
-      el.textContent = 'Nenhuma fila carregada. Importe um CSV.';
-      return;
+    const tarefa = loadTarefa();
+    const linhas = [];
+    if (tarefa) {
+      linhas.push(`Esta aba: ${rotuloTarefa(tarefa)} — ${tarefa.fase}${tarefa.autos ? ` / autos: ${tarefa.autos.sub}` : ''}`);
+    } else if (ehCoordenadora()) {
+      linhas.push('Esta aba: coordenadora (abre e acompanha as demais).');
     }
-    const total = state.fila.length;
-    const concluidos = state.fila.filter((p) => p.status === 'concluido').length;
-    const erros = state.fila.filter((p) => p.status === 'erro').length;
-    el.textContent = `Fila: ${total} | concluídos: ${concluidos} | erros/pendências: ${erros} | fase: ${state.fase}`;
+    if (!state) {
+      linhas.push('Nenhuma fila carregada. Importe um CSV.');
+    } else {
+      const conta = (st) => state.fila.filter((p) => p.status === st).length;
+      linhas.push(
+        `Fila: ${state.fila.length} | em andamento: ${conta('em_andamento')} | concluídos: ${conta('concluido')} | pendentes: ${conta('pendente')} | erros: ${conta('erro')}${state.pausado ? ' | PAUSADA' : ''}`
+      );
+    }
+    el.textContent = linhas.join('\n');
+    el.style.whiteSpace = 'pre-wrap';
   }
   function escapeHtml(s) {
     return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1262,7 +1779,11 @@
       state.pausado = true;
       saveState(state);
     }
-    log('Processamento pausado pelo usuário. Clique em Iniciar para retomar de onde parou.');
+    // As abas de trabalho leem `pausado` no começo de cada passo e param
+    // sozinhas — mas só depois de terminar o passo em que estão (um download
+    // já disparado vai até o fim, o que é o comportamento desejado).
+    log('Processamento pausado. A coordenadora não abre mais abas, e cada aba de trabalho para ao fim do passo atual. Clique em Iniciar para retomar.');
+    renderStatus();
   }
 
   function iniciarProcessamento() {
@@ -1271,10 +1792,48 @@
       log('Importe um CSV antes de iniciar.', 'erro');
       return;
     }
+    // Retomando depois de um "Parar" (ou de uma sessão anterior), itens
+    // marcados "em andamento" são de abas que já não existem: voltam para
+    // pendente, senão as vagas nunca são liberadas.
+    if (state.pausado) {
+      let devolvidos = 0;
+      for (const item of state.fila) {
+        if (item.status === 'em_andamento') {
+          item.status = 'pendente';
+          devolvidos += 1;
+        }
+      }
+      if (devolvidos > 0) log(`${devolvidos} item(ns) que estavam em andamento voltaram para a fila.`);
+    }
     state.pausado = false;
     saveState(state);
-    log('Processamento iniciado/retomado.');
-    avancarFila().catch((e) => log(`Erro inesperado ao avançar a fila: ${e.message}`, 'erro'));
+    marcarComoCoordenadora();
+    const opcoes = loadOpcoes();
+    const pendentes = state.fila.filter((p) => p.status === 'pendente').length;
+    log(`Iniciando: ${pendentes} item(ns) pendente(s), até ${opcoes.maxAbas} aba(s) ao mesmo tempo. O Chrome precisa PERMITIR POP-UPS para este site — se ele bloquear, o script avisa e cai para uma aba só.`);
+    renderStatus();
+    supervisionar().catch((e) => log(`Supervisão falhou: ${e && e.message ? e.message : e}`, 'erro'));
+  }
+
+  // Botão "Diagnóstico doc." — segue o link do Evento 1 (ou o primeiro
+  // documento da página) e relata como se chega ao arquivo. É o que diz, numa
+  // rodada, qual é a forma real da página intermediária deste tribunal.
+  async function diagnosticoDocumentoDaPagina() {
+    const eventos = lerEventos();
+    const { documento } = localizarEvento1(eventos);
+    const alvo = documento || lerLinhasEventos(eventos)[0];
+    if (!alvo) {
+      log('Nenhum link de documento nesta página para diagnosticar — abra um processo com eventos.', 'erro');
+      return;
+    }
+    log(`Diagnóstico de documento: seguindo "${alvo.rotulo}"...`);
+    const r = await resolverUrlDocumento(alvo.href);
+    diagnosticoDocumento(alvo.href, r, alvo.rotulo);
+    if (r.url) {
+      log(`Diagnóstico de documento: o arquivo de verdade está em ${r.url} (${r.contentType || 'tipo desconhecido'}).`);
+    } else {
+      log(`Diagnóstico de documento: não se chegou ao arquivo — ${r.aviso}`, 'erro');
+    }
   }
 
   // Dispara a busca por um número (processo principal ou IP referenciado,
@@ -1291,20 +1850,30 @@
   // Sub-máquina do "Download Completo".
   //
   // POR QUE É UMA MÁQUINA DE ESTADOS E NÃO UMA FUNÇÃO COM AWAIT:
-  // não se sabe (ainda não testado contra a tela real) se "Download Completo"
-  // abre um modal na mesma página ou NAVEGA para outra tela. Se navegar,
-  // qualquer `await` depois do clique nunca retorna — foi exatamente essa
-  // armadilha que já derrubou o fluxo da busca em 03/09/2026. Escrever como
-  // sub-fases persistidas funciona nos DOIS casos: o passo é salvo em
-  // `state.autos.sub` ANTES do clique, e retomado do zero na carga seguinte
-  // se houve navegação, ou seguido inline se não houve.
+  // "Download Completo" pode abrir um modal na mesma página ou NAVEGAR para
+  // outra tela. Se navegar, qualquer `await` depois do clique nunca retorna —
+  // a página que o executava deixou de existir. Escrever como sub-fases
+  // persistidas funciona nos DOIS casos: o passo é salvo em `tarefa.autos.sub`
+  // ANTES do clique, e é retomado do zero na carga seguinte se houve
+  // navegação, ou seguido inline se não houve.
   //
-  // Devolve:
-  //   'continuar' — etapa dos autos terminou, o chamador segue o fluxo
-  //   'navegou'   — a página vai recarregar; avancarFila() deve retornar
+  // BUG CORRIGIDO NA v0.5.0 (era por isso que as partes nunca eram baixadas):
+  // até a v0.4.0 esta função devolvia 'continuar' assim que a PRÓXIMA tela
+  // aparecia, e quem chamava entendia 'continuar' como "a etapa dos autos
+  // acabou" — apagava o estado e ia para o próximo passo. Resultado: o script
+  // abria a tela de opções, e ali morria. Ninguém chegava a clicar em "Gerar
+  // Arquivo Completo" nem nos links de parte. Agora há dois retornos
+  // diferentes, e a diferença entre eles é o conserto:
+  //
+  //   'prosseguir' — mudei de sub-fase e a página é a mesma: me chame de novo,
+  //                  agora, para executar a sub-fase seguinte.
+  //   'terminado'  — a etapa dos autos acabou (com sucesso ou com diagnóstico).
+  //
+  // (Se a página navegar, esta função nem chega a retornar: morre junto com a
+  // página, e a carga seguinte retoma pela sub-fase que já ficou salva.)
   // ======================================================================
-  async function avancarAutos(state) {
-    const autos = state.autos;
+  async function avancarAutos(tarefa) {
+    const autos = tarefa.autos;
     const { numeroProcesso, ip, prefixo } = autos.contexto;
     const rotuloAlvo = ip ? `${numeroProcesso} (IP ${ip})` : numeroProcesso;
 
@@ -1313,19 +1882,21 @@
       if (!botao) {
         log(`${rotuloAlvo}: botão "${CONFIG.labels.downloadCompleto}" não encontrado nesta tela. Gerando diagnóstico e pulando os autos deste item.`, 'erro');
         diagnosticoTela(`botão "${CONFIG.labels.downloadCompleto}" não encontrado (${rotuloAlvo})`);
-        return 'continuar';
+        return 'terminado';
       }
       autos.sub = 'opcoes';
-      saveState(state); // ANTES do clique: se navegar, a fase já está salva
+      saveTarefa(tarefa); // ANTES do clique: se navegar, a sub-fase já está salva
       log(`${rotuloAlvo}: abrindo "${CONFIG.labels.downloadCompleto}".`);
       botao.click();
-      // Se for modal (mesma página), a tela de opções aparece aqui e seguimos
-      // inline. Se navegar, esta espera morre junto com a página e a próxima
-      // carga retoma em 'opcoes'.
       const apareceu = await aguardarControle(CONFIG.labels.gerarArquivoCompleto, {
         timeoutMs: CONFIG.downloadCompleto.timeoutTelaMs,
       });
-      return apareceu ? 'continuar' : 'navegou';
+      if (!apareceu) {
+        log(`${rotuloAlvo}: cliquei em "${CONFIG.labels.downloadCompleto}", a página não navegou e a tela de opções não apareceu em ${Math.round(CONFIG.downloadCompleto.timeoutTelaMs / 1000)}s. Se o eproc abriu a tela numa ABA NOVA, é lá que o trabalho continua — esta aba desiste. Gerando diagnóstico.`, 'erro');
+        diagnosticoTela(`tela de opções não apareceu depois do clique em "${CONFIG.labels.downloadCompleto}" (${rotuloAlvo})`);
+        return 'terminado';
+      }
+      return 'prosseguir';
     }
 
     if (autos.sub === 'opcoes') {
@@ -1335,79 +1906,79 @@
       if (!gerar) {
         log(`${rotuloAlvo}: a tela de opções do Download Completo não apareceu (botão "${CONFIG.labels.gerarArquivoCompleto}" não encontrado). Gerando diagnóstico e pulando os autos deste item.`, 'erro');
         diagnosticoTela(`tela de opções não apareceu (${rotuloAlvo})`);
-        return 'continuar';
+        return 'terminado';
       }
+      // Marcar as três opções obrigatórias ANTES de gerar — depois do clique
+      // em "Gerar" já não adianta (o PDF sai como as opções estavam).
       configurarOpcoesDownloadCompleto(rotuloAlvo);
       autos.sub = 'gerando';
       autos.tentativas = 0;
-      saveState(state);
+      autos.partesFeitas = [];
+      saveTarefa(tarefa);
       log(`${rotuloAlvo}: clicando em "${CONFIG.labels.gerarArquivoCompleto}" — isso pode levar vários minutos.`);
       gerar.click();
-      const pronto = await aguardarTextoNaPagina(CONFIG.labels.geradoComSucesso, { timeoutMs: 60000 });
-      return pronto ? 'continuar' : 'navegou';
+      return 'prosseguir'; // quem espera é a sub-fase 'gerando'
     }
 
     if (autos.sub === 'gerando') {
       // Espera longa e com log de progresso: o eproc pode levar ~10 min num
-      // processo grande, e uma espera silenciosa parece travamento.
+      // processo grande, e uma espera silenciosa parece travamento. As
+      // primeiras verificações são rápidas (processo pequeno fica pronto em
+      // segundos e não faz sentido pagar 15s por isso).
       for (let i = autos.tentativas || 0; i < CONFIG.pollDownloadCompletoMaxTentativas; i++) {
         if (temTextoNaPagina(CONFIG.labels.geradoComSucesso) || acharControle(CONFIG.labels.baixarArquivo)) {
           autos.sub = 'baixando';
-          saveState(state);
+          saveTarefa(tarefa);
           log(`${rotuloAlvo}: arquivo completo gerado.`);
-          return 'continuar';
+          return 'prosseguir';
         }
         autos.tentativas = i + 1;
-        saveState(state);
-        const minutos = Math.round(((i + 1) * CONFIG.pollDownloadCompletoMs) / 60000);
+        saveTarefa(tarefa);
+        sinalizarVida(tarefa);
         if ((i + 1) % 4 === 0) {
-          log(`${rotuloAlvo}: ainda gerando o arquivo completo (~${minutos} min). Mantenha esta aba em primeiro plano.`);
+          const minutos = Math.round(((i + 1) * CONFIG.pollDownloadCompletoMs) / 60000);
+          log(`${rotuloAlvo}: ainda gerando o arquivo completo (~${minutos} min).`);
         }
-        await sleep(CONFIG.pollDownloadCompletoMs);
+        await sleep(i < 5 ? 2000 : CONFIG.pollDownloadCompletoMs);
       }
       log(`${rotuloAlvo}: o arquivo completo não ficou pronto dentro do limite (~${Math.round((CONFIG.pollDownloadCompletoMaxTentativas * CONFIG.pollDownloadCompletoMs) / 60000)} min). Gerando diagnóstico e seguindo — baixe este processo manualmente.`, 'erro');
       diagnosticoTela(`arquivo completo não ficou pronto no limite (${rotuloAlvo})`);
-      return 'continuar';
+      return 'terminado';
     }
 
     if (autos.sub === 'baixando') {
-      const resultado = await baixarPartesDosAutos(prefixo, { numeroProcesso, ip });
+      const resultado = await baixarPartesDosAutos(prefixo, {
+        numeroProcesso,
+        ip,
+        // Se um clique em "BAIXAR ARQUIVO PARTE n" navegar a página, esta aba
+        // morre e retoma em 'baixando' — sem esta lista, as partes já baixadas
+        // seriam baixadas de novo.
+        jaFeitas: autos.partesFeitas || [],
+        aoBaixar: (parte) => {
+          autos.partesFeitas = (autos.partesFeitas || []).concat(parte);
+          saveTarefa(tarefa);
+        },
+      });
       if (resultado.baixadas > 0) {
         log(`${rotuloAlvo}: ${resultado.baixadas} parte(s) dos autos baixada(s)${resultado.viaClique ? ` (${resultado.viaClique} por clique — nome dado pelo eproc, ver manifesto)` : ''}.`);
       }
-      const voltar = acharControle(CONFIG.labels.voltar);
-      if (voltar) {
-        saveState(state);
-        voltar.click();
-        await sleep(2000);
-      }
-      return 'continuar';
+      return 'terminado';
     }
 
     log(`${rotuloAlvo}: sub-fase de autos desconhecida ("${autos.sub}") — pulando os autos deste item.`, 'erro');
-    return 'continuar';
+    return 'terminado';
   }
 
   function temTextoNaPagina(texto) {
-    return (document.body.innerText || '').toLowerCase().includes(texto.toLowerCase());
+    return normalizar(document.body.innerText || '').includes(normalizar(texto));
   }
 
-  async function aguardarTextoNaPagina(texto, { timeoutMs = 30000, intervaloMs = 500 } = {}) {
-    const inicio = Date.now();
-    while (Date.now() - inicio < timeoutMs) {
-      if (temTextoNaPagina(texto)) return true;
-      await sleep(intervaloMs);
-    }
-    return false;
-  }
-
-  // Prepara o state para entrar na etapa de autos e devolve para onde voltar
-  // quando ela terminar.
-  function entrarEmAutos(state, { numeroProcesso, ip = null, voltarPara }) {
-    state.autos = {
+  // Prepara a tarefa da aba para entrar na etapa de autos.
+  function entrarEmAutos(tarefa, { numeroProcesso, ip = null }) {
+    tarefa.autos = {
       sub: 'abrir',
       tentativas: 0,
-      voltarPara,
+      partesFeitas: [],
       contexto: {
         numeroProcesso,
         ip,
@@ -1416,8 +1987,8 @@
           : nomeSeguro(numeroProcesso),
       },
     };
-    state.fase = 'autos';
-    saveState(state);
+    tarefa.fase = 'autos';
+    saveTarefa(tarefa);
   }
 
   // ======================================================================
@@ -1427,7 +1998,7 @@
   // É o plano B deliberado para um dia de trabalho: se a automação da fila
   // esbarrar em qualquer coisa não prevista, dá para abrir o processo à mão e
   // clicar aqui — perde-se a automação da lista, não o dia. Reaproveita a
-  // mesma sub-máquina, com uma fila de um item só.
+  // mesma sub-máquina, com uma tarefa avulsa (que não mexe na fila).
   // ======================================================================
   async function baixarAutosDaPaginaAtual() {
     const numeroProcesso = numeroDoProcessoDaPagina();
@@ -1436,15 +2007,17 @@
       diagnosticoTela('número do processo não identificado na página atual');
       return;
     }
-    const state = loadState() || newState([]);
-    if (!state.fila.find((p) => p.numero === numeroProcesso)) {
-      state.fila.push({ numero: numeroProcesso, status: 'em_andamento', ip: [], observacao: '' });
-    }
-    state.pausado = false;
-    state.processoAtual = numeroProcesso;
-    entrarEmAutos(state, { numeroProcesso, voltarPara: 'apos_autos_avulso' });
+    const tarefa = {
+      tipo: 'avulso',
+      numero: numeroProcesso,
+      processoPai: null,
+      fase: 'autos',
+      autos: null,
+      abertaPeloScript: false,
+    };
+    entrarEmAutos(tarefa, { numeroProcesso });
     log(`${numeroProcesso}: baixando autos desta página (modo avulso, fora da fila).`);
-    await avancarFila();
+    await avancarAba();
   }
 
   // Número do processo a partir da própria página. Tenta a URL primeiro
@@ -1462,215 +2035,390 @@
     return null;
   }
 
-  let processando = false; // trava só dentro de UMA carga de página — impede reentrância
+  // ======================================================================
+  // MODO MULTI-ABA (v0.5.0) — o que mudou e por quê
+  //
+  // Até a v0.4.0 uma aba só fazia tudo, um processo por vez. O gargalo é o
+  // "Gerar Arquivo Completo", que leva minutos por processo: nove processos
+  // eram nove esperas somadas, e o dia acabava antes da fila.
+  //
+  // Agora a aba onde o CSV foi importado vira COORDENADORA e abre UMA ABA POR
+  // PROCESSO (até `opcoes.maxAbas` ao mesmo tempo). Cada aba faz o processo
+  // inteiro sozinha e devolve o resultado ao estado global. Os inquéritos
+  // policiais referenciados entram na mesma fila e também ganham aba própria,
+  // em vez de serem rebuscados dentro da aba do processo — que era o que
+  // obrigava tudo a ser sequencial.
+  //
+  // Três peças fazem isso funcionar:
+  //  - sessionStorage é POR ABA (GM_setValue é global): é onde cada aba guarda
+  //    "qual é a minha tarefa e em que passo estou", e sobrevive à navegação
+  //    da busca dentro da própria aba.
+  //  - sleep() por Web Worker (ver o comentário lá em cima): sem isso, o
+  //    Chrome estrangularia os temporizadores das N-1 abas em segundo plano.
+  //  - só a coordenadora chama window.open. As abas de trabalho apenas
+  //    ACRESCENTAM itens à fila (os IPs que encontram); quem abre é sempre a
+  //    coordenadora, que é também quem respeita o limite de abas simultâneas.
+  //
+  // REQUISITO DO NAVEGADOR: o Chrome precisa PERMITIR POP-UPS para o eproc,
+  // senão window.open devolve null. Quando isso acontece o script avisa e cai
+  // sozinho para o modo sequencial na própria aba — mais lento, mas não perde
+  // o dia.
+  //
+  // Sobre corrida entre abas: todas escrevem no mesmo estado global via
+  // GM_setValue (ler-modificar-gravar, sem transação). As escritas são raras
+  // (mudança de status e um sinal de vida a cada ~20s), e a única que não pode
+  // se perder — o status final — é conferida e reescrita até valer.
+  // ======================================================================
 
-  // ======================================================================
-  // Máquina de estados da fila. CONFIRMADO em teste real (03/09/2026): a
-  // busca por número navega a página inteira (a tela recarrega), então não
-  // dá pra escrever isto como "uma função só com await no meio" — qualquer
-  // `await` depois de dispararBusca() nunca retornaria, porque a página que
-  // o executava já não existe mais. Em vez disso, `avancarFila()` é chamada
-  // do zero a cada carregamento (ver rodapé do arquivo) e decide o que fazer
-  // só a partir do que está salvo em `state` (GM_setValue sobrevive à
-  // navegação; variáveis JS não). Cada ramo ou:
-  //   (a) termina a etapa e faz `continue` para a próxima, sem navegar; ou
-  //   (b) chama dispararBusca() e faz `return` — o resto acontece na
-  //       próxima carga de página, quando avancarFila() rodar de novo.
-  // ======================================================================
-  async function avancarFila() {
-    if (processando) return;
-    processando = true;
+  let processandoAba = false;  // trava de reentrância dentro de UMA carga de página
+  let supervisionando = false;
+
+  // ----------------------------------------------------------------------
+  // A aba de trabalho: leva UMA tarefa (um processo ou um IP) do começo ao
+  // fim. Cada ramo ou (a) termina o passo e faz `continue`, sem navegar, ou
+  // (b) dispara algo que navega a página e faz `return` — o resto acontece na
+  // próxima carga, quando avancarAba() rodar de novo a partir do que ficou
+  // salvo no sessionStorage.
+  // ----------------------------------------------------------------------
+  async function avancarAba() {
+    if (processandoAba) return;
+    processandoAba = true;
     try {
       while (true) {
-        const state = loadState();
-        if (!state || state.pausado) return;
+        const tarefa = loadTarefa();
+        if (!tarefa) return;
 
-        if (state.fase === 'autos') {
-          const resultado = await avancarAutos(state);
-          if (resultado === 'navegou') return;
-          const voltarPara = state.autos.voltarPara;
-          state.autos = null;
-          state.fase = voltarPara;
-          saveState(state);
-          continue;
-        }
-
-        if (state.fase === 'apos_autos_avulso') {
-          // Modo avulso (botão "Baixar autos desta página"): terminou o item,
-          // não puxa o próximo da fila — quem clicou quer só este processo.
-          const item = state.fila.find((p) => p.numero === state.processoAtual);
-          if (item) item.status = 'concluido';
-          state.fase = 'ocioso';
-          state.pausado = true; // não retoma a fila sozinho na próxima carga
-          saveState(state);
-          log(`${state.processoAtual}: autos desta página processados. (Modo avulso — a fila segue pausada; clique "Iniciar" para rodar a fila do CSV.)`);
+        const global = loadState();
+        if (tarefa.tipo !== 'avulso' && global && global.pausado) {
+          log(`${rotuloTarefa(tarefa)}: fila pausada — esta aba parou aqui. Clique em "Iniciar" na aba principal para retomar.`, 'aviso');
           return;
         }
+        sinalizarVida(tarefa);
 
-        if (state.fase === 'ocioso') {
-          const item = state.fila.find((p) => p.status === 'pendente' || p.status === 'em_andamento');
-          if (!item) {
-            log('Fila concluída — nenhum processo pendente.');
-            return;
-          }
-          item.status = 'em_andamento';
-          state.processoAtual = item.numero;
-          state.fase = 'aguardando_busca_principal';
-          saveState(state);
-          renderStatus();
-
+        if (tarefa.fase === 'buscar') {
           const caixaBusca = findSearchBox();
           if (!caixaBusca) {
-            item.status = 'erro';
-            item.observacao = 'Caixa de pesquisa não encontrada.';
-            state.fase = 'ocioso';
-            saveState(state);
-            log(`${item.numero}: caixa de pesquisa não encontrada — ajuste CONFIG.searchBoxSelectors.`, 'erro');
-            continue;
+            finalizarTarefa(tarefa, 'erro', 'caixa de pesquisa não encontrada nesta aba — ajuste CONFIG.searchBoxSelectors');
+            return;
           }
-          log(`${item.numero}: iniciando — buscando.`);
-          dispararBusca(caixaBusca, item.numero);
+          tarefa.fase = 'eventos';
+          saveTarefa(tarefa); // ANTES da busca: ela navega a página
+          log(`${rotuloTarefa(tarefa)}: buscando.`);
+          dispararBusca(caixaBusca, tarefa.numero);
+          // Se a busca navegar (é o caso confirmado em 03/09/2026), este await
+          // morre junto com a página e a carga seguinte retoma em 'eventos'.
+          // Se NÃO navegar (AJAX), a tabela aparece aqui e seguimos inline.
+          const tabela = await aguardarElemento(CONFIG.tabelaEventosSelector, { timeoutMs: 25000 });
+          if (tabela) continue;
+          log(`${rotuloTarefa(tarefa)}: busca disparada, mas a página não navegou nem trouxe a tabela de eventos em 25s. Aguardando — se ficar assim, confira o número e recarregue esta aba.`, 'aviso');
           return;
         }
 
-        if (state.fase === 'aguardando_busca_principal') {
-          const numeroProcesso = state.processoAtual;
-          const item = state.fila.find((p) => p.numero === numeroProcesso);
-          const tabela = await aguardarElemento('#tblEventos', { timeoutMs: 20000 });
+        if (tarefa.fase === 'eventos') {
+          const tabela = await aguardarElemento(CONFIG.tabelaEventosSelector, { timeoutMs: 25000 });
           if (!tabela) {
-            item.status = 'erro';
-            item.observacao = 'Tabela de eventos não apareceu após a busca.';
-            state.fase = 'ocioso';
-            saveState(state);
-            log(`${numeroProcesso}: tabela de eventos (#tblEventos) não apareceu a tempo depois da busca — confira o número ou CONFIG.searchBoxSelectors.`, 'erro');
-            continue;
+            finalizarTarefa(tarefa, 'erro', 'a tabela de eventos não apareceu depois da busca — confira o número do processo');
+            return;
           }
-
           await carregarTodosOsEventos();
           const eventos = lerEventos();
           const linhasEventos = lerLinhasEventos(eventos);
           if (linhasEventos.length === 0) {
-            log(`${numeroProcesso}: tabela de eventos encontrada, mas nenhum documento foi lido (${eventos.length} linha(s) de evento). Clique em "Diagnóstico" no painel e mande o arquivo gerado — ele diz qual seletor deixou de bater.`, 'aviso');
-          }
-
-          const ips = encontrarIPsReferenciados();
-          item.ip = ips;
-          if (ips.length > 0) {
-            log(`${numeroProcesso}: ${ips.length} inquérito(s) policial(is) referenciado(s): ${ips.join(', ')}.`);
+            log(`${rotuloTarefa(tarefa)}: tabela de eventos encontrada, mas nenhum documento foi lido (${eventos.length} linha(s) de evento). Clique em "Diagnóstico" no painel e mande o arquivo gerado.`, 'aviso');
           }
 
           const opcoes = loadOpcoes();
-          if (opcoes.denuncia) await tratarDenuncia(numeroProcesso, linhasEventos, eventos);
-          if (opcoes.midia) await tratarMidia(numeroProcesso, linhasEventos);
 
-          // Autos completos ANTES de sair para o IP: a tela de Download
-          // Completo é do processo aberto agora, e buscar o IP navega para
-          // longe dela.
+          // Os IPs entram na FILA GLOBAL e serão abertos pela coordenadora em
+          // abas próprias — esta aba não os processa nem espera por eles.
+          if (tarefa.tipo === 'processo' && opcoes.ips) {
+            const ips = encontrarIPsReferenciados();
+            if (ips.length > 0) {
+              const novos = enfileirarIPs(tarefa.numero, ips);
+              log(`${tarefa.numero}: ${ips.length} inquérito(s) policial(is) referenciado(s): ${ips.join(', ')}${novos ? ` — ${novos} acrescentado(s) à fila, cada um numa aba própria.` : ' (já estavam na fila).'}`);
+            }
+          }
+
+          if (opcoes.denuncia && tarefa.tipo === 'processo') {
+            try {
+              await tratarDenuncia(tarefa.numero, linhasEventos, eventos);
+            } catch (e) {
+              // A denúncia é importante, mas os AUTOS são o que não pode faltar
+              // no dia da audiência: um erro aqui não derruba o resto.
+              log(`${tarefa.numero}: falha ao baixar a denúncia (${e && e.message ? e.message : e}) — seguindo para os autos.`, 'erro');
+            }
+          }
+
+          if (opcoes.midia) {
+            await tratarMidia(
+              tarefa.tipo === 'ip' ? tarefa.processoPai : tarefa.numero,
+              linhasEventos,
+              tarefa.tipo === 'ip' ? { prefixoExtra: `IP_${nomeSeguro(tarefa.numero)}` } : {}
+            );
+          }
+
           if (opcoes.autos) {
-            entrarEmAutos(state, { numeroProcesso, voltarPara: 'apos_autos_principal' });
+            // Autos do IP levam o número do PROCESSO PAI no nome — é o que
+            // permite saber, olhando a pasta de downloads, de que processo
+            // aquele inquérito veio.
+            entrarEmAutos(tarefa, {
+              numeroProcesso: tarefa.tipo === 'ip' ? tarefa.processoPai : tarefa.numero,
+              ip: tarefa.tipo === 'ip' ? tarefa.numero : null,
+            });
             continue;
           }
-          state.fase = 'apos_autos_principal';
-          saveState(state);
+          tarefa.fase = 'concluir';
+          saveTarefa(tarefa);
           continue;
         }
 
-        if (state.fase === 'apos_autos_principal') {
-          const numeroProcesso = state.processoAtual;
-          const item = state.fila.find((p) => p.numero === numeroProcesso);
-          const ips = item.ip || [];
-          const opcoes = loadOpcoes();
-
-          // Decisão do Ponto 2 (03/09/2026): rebuscar o número do IP na mesma
-          // caixa de busca, em vez de clicar no link da caixa azul — evita a
-          // dúvida sobre abrir em nova aba. Ainda não confirmado: se a busca
-          // do topo aceita números de inquérito policial (só processo
-          // "principal" foi testado).
-          if (ips.length > 0 && opcoes.ips) {
-            state.ipIndiceAtual = 0;
-            state.fase = 'aguardando_busca_ip';
-            saveState(state);
-            const caixaBusca = findSearchBox();
-            if (!caixaBusca) {
-              log(`${numeroProcesso}: caixa de busca não encontrada para rebuscar o IP ${ips[0]} — pulando IP(s) deste processo.`, 'erro');
-              item.status = 'concluido';
-              state.fase = 'ocioso';
-              saveState(state);
-              continue;
-            }
-            log(`${numeroProcesso}: buscando IP referenciado ${ips[0]}.`);
-            dispararBusca(caixaBusca, ips[0]);
-            return;
-          }
-
-          item.status = 'concluido';
-          state.fase = 'ocioso';
-          saveState(state);
-          log(`${numeroProcesso}: concluído.`);
+        if (tarefa.fase === 'autos') {
+          const resultado = await avancarAutos(tarefa);
+          if (resultado === 'prosseguir') continue; // <- o conserto da v0.5.0
+          tarefa.autos = null;
+          tarefa.fase = 'concluir';
+          saveTarefa(tarefa);
           continue;
         }
 
-        if (state.fase === 'aguardando_busca_ip') {
-          const numeroProcesso = state.processoAtual;
-          const item = state.fila.find((p) => p.numero === numeroProcesso);
-          const ip = item.ip[state.ipIndiceAtual];
-          const tabela = await aguardarElemento('#tblEventos', { timeoutMs: 20000 });
-          if (!tabela) {
-            log(`${numeroProcesso}: IP ${ip} não abriu tabela de eventos ao rebuscar pelo número — pulado, revisar manualmente (ver Ponto 2 da decisão de 03/09/2026).`, 'erro');
-          } else {
-            const opcoes = loadOpcoes();
-            await carregarTodosOsEventos();
-            if (opcoes.midia) {
-              const linhasIp = lerLinhasEventos();
-              await tratarMidia(numeroProcesso, linhasIp, { prefixoExtra: `IP_${nomeSeguro(ip)}` });
-            }
-            // Autos do IP, com o número do PROCESSO PAI no nome — é o que
-            // permite saber, olhando a pasta de downloads, de que processo
-            // aquele inquérito veio: "<processo>__IP_<numeroIP>__AUTOS_PARTE_N.pdf".
-            if (opcoes.autos) {
-              entrarEmAutos(state, { numeroProcesso, ip, voltarPara: 'apos_autos_ip' });
-              continue;
-            }
-          }
-
-          state.fase = 'apos_autos_ip';
-          saveState(state);
-          continue;
+        if (tarefa.fase === 'concluir') {
+          finalizarTarefa(tarefa, 'concluido', '');
+          return;
         }
 
-        if (state.fase === 'apos_autos_ip') {
-          const numeroProcesso = state.processoAtual;
-          const item = state.fila.find((p) => p.numero === numeroProcesso);
-          const proximoIndice = state.ipIndiceAtual + 1;
-          if (proximoIndice < item.ip.length) {
-            const caixaBusca = findSearchBox();
-            if (caixaBusca) {
-              state.ipIndiceAtual = proximoIndice;
-              saveState(state);
-              log(`${numeroProcesso}: buscando IP referenciado ${item.ip[proximoIndice]}.`);
-              dispararBusca(caixaBusca, item.ip[proximoIndice]);
-              return;
-            }
-            log(`${numeroProcesso}: caixa de busca não encontrada para rebuscar o próximo IP — encerrando IPs deste processo.`, 'erro');
-          }
-
-          item.status = 'concluido';
-          state.fase = 'ocioso';
-          saveState(state);
-          log(`${numeroProcesso}: IP(s) referenciado(s) processado(s).`);
-          continue;
-        }
-
-        // Fase desconhecida — não deveria acontecer; evita loop infinito.
-        log(`Fase de estado desconhecida ("${state.fase}") — processamento interrompido.`, 'erro');
-        state.fase = 'ocioso';
-        saveState(state);
+        log(`${rotuloTarefa(tarefa)}: fase desconhecida ("${tarefa.fase}") — esta aba parou.`, 'erro');
+        finalizarTarefa(tarefa, 'erro', `fase desconhecida "${tarefa.fase}"`);
         return;
       }
+    } catch (e) {
+      const tarefa = loadTarefa();
+      if (tarefa) {
+        log(`${rotuloTarefa(tarefa)}: erro inesperado (${e && e.message ? e.message : e}).`, 'erro');
+        finalizarTarefa(tarefa, 'erro', String((e && e.message) || e));
+      } else {
+        log(`Erro inesperado nesta aba: ${e && e.message ? e.message : e}`, 'erro');
+      }
     } finally {
-      processando = false;
+      processandoAba = false;
       renderStatus();
     }
+  }
+
+  // Sinal de vida da aba, para a coordenadora saber que ela não travou.
+  // Estrangulado a 1 escrita por 20s: com N abas escrevendo no mesmo estado
+  // global, escrever a cada volta do laço só aumentaria a chance de corrida.
+  let ultimoSinalEnviado = 0;
+  function sinalizarVida(tarefa) {
+    if (!tarefa || tarefa.tipo === 'avulso') return;
+    const agora = Date.now();
+    if (agora - ultimoSinalEnviado < 20000) return;
+    ultimoSinalEnviado = agora;
+    const state = loadState();
+    const item = acharItem(state, tarefa);
+    if (!item) return;
+    item.ultimoSinal = agora;
+    saveState(state);
+  }
+
+  // O status final é a única escrita que não pode se perder numa corrida entre
+  // abas: confere e reescreve até valer.
+  function finalizarTarefa(tarefa, status, observacao) {
+    if (tarefa.tipo === 'avulso') {
+      clearTarefa();
+      log(`${tarefa.numero}: autos desta página processados (modo avulso). A fila do CSV não foi tocada.`);
+      renderStatus();
+      return;
+    }
+
+    for (let tentativa = 0; tentativa < 3; tentativa++) {
+      const state = loadState();
+      const item = acharItem(state, tarefa);
+      if (!item) break;
+      item.status = status;
+      item.observacao = observacao || '';
+      item.ultimoSinal = Date.now();
+      saveState(state);
+      const conferencia = acharItem(loadState(), tarefa);
+      if (conferencia && conferencia.status === status) break;
+    }
+    clearTarefa();
+    log(
+      status === 'concluido'
+        ? `${rotuloTarefa(tarefa)}: concluído.`
+        : `${rotuloTarefa(tarefa)}: ERRO — ${observacao}`,
+      status === 'concluido' ? 'info' : 'erro'
+    );
+    renderStatus();
+
+    const opcoes = loadOpcoes();
+    if (tarefa.abertaPeloScript && opcoes.fecharAba) {
+      log(`${rotuloTarefa(tarefa)}: esta aba fecha em ${Math.round(CONFIG.multiAba.atrasoParaFecharMs / 1000)}s (desmarque "fechar aba ao terminar" no painel para mantê-la aberta).`);
+      sleep(CONFIG.multiAba.atrasoParaFecharMs).then(() => {
+        try {
+          window.close();
+        } catch (e) { /* o navegador pode recusar; a aba só fica aberta */ }
+      });
+    } else if (!tarefa.abertaPeloScript && ehCoordenadora()) {
+      // Esta é a aba coordenadora, que assumiu a tarefa por falta de pop-up:
+      // volta a supervisionar a fila.
+      sleep(500).then(() => supervisionar().catch((e) => log(`Supervisão falhou: ${e && e.message ? e.message : e}`, 'erro')));
+    }
+  }
+
+  // Acrescenta os IPs encontrados à fila global. Devolve quantos eram novos.
+  function enfileirarIPs(processoPai, ips) {
+    const state = loadState();
+    if (!state) return 0;
+    let novos = 0;
+    for (const ip of ips) {
+      const jaTem = state.fila.some((p) => p.tipo === 'ip' && p.numero === ip && p.processoPai === processoPai);
+      if (jaTem) continue;
+      state.fila.push(itemDeFila(ip, 'ip', processoPai));
+      novos += 1;
+    }
+    if (novos > 0) saveState(state);
+    return novos;
+  }
+
+  // ----------------------------------------------------------------------
+  // A aba coordenadora: mantém até `maxAbas` itens em andamento e vai abrindo
+  // os próximos conforme as abas terminam. Nunca processa nada por si — a não
+  // ser quando os pop-ups estão bloqueados (ver assumirTarefaNestaAba).
+  // ----------------------------------------------------------------------
+  async function supervisionar() {
+    if (supervisionando) return;
+    supervisionando = true;
+    try {
+      while (true) {
+        const state = loadState();
+        if (!state) return;
+        if (state.pausado) {
+          log('Fila pausada — a coordenadora parou de abrir abas novas.');
+          return;
+        }
+
+        const opcoes = loadOpcoes();
+        const maxAbas = Math.max(1, Math.min(12, Number(opcoes.maxAbas) || CONFIG.multiAba.maxAbasSimultaneas));
+
+        // Libera a vaga de abas que morreram (usuário fechou, travou, caiu).
+        const agora = Date.now();
+        let mudou = false;
+        for (const item of state.fila) {
+          if (item.status !== 'em_andamento') continue;
+          if (!item.ultimoSinal || agora - item.ultimoSinal <= CONFIG.multiAba.timeoutSemSinalMs) continue;
+          item.status = 'erro';
+          item.observacao = 'a aba parou de dar sinal de vida';
+          mudou = true;
+          log(`${rotuloItem(item)}: sem sinal de vida há mais de ${Math.round(CONFIG.multiAba.timeoutSemSinalMs / 60000)} min — marcado como erro e a vaga liberada. Confira se a aba ainda está aberta.`, 'erro');
+        }
+        if (mudou) saveState(state);
+
+        const emAndamento = state.fila.filter((p) => p.status === 'em_andamento');
+        const pendentes = state.fila.filter((p) => p.status === 'pendente');
+
+        if (pendentes.length === 0 && emAndamento.length === 0) {
+          const concluidos = state.fila.filter((p) => p.status === 'concluido').length;
+          const erros = state.fila.filter((p) => p.status === 'erro').length;
+          renderStatus();
+          log(`Fila concluída: ${concluidos} item(ns) concluído(s)${erros ? `, ${erros} com erro (veja o log acima e o Manifesto)` : ''}.`);
+          return;
+        }
+
+        const vagas = maxAbas - emAndamento.length;
+        for (let i = 0; i < Math.min(vagas, pendentes.length); i++) {
+          // Relê a cada abertura: as abas de trabalho escrevem no mesmo estado.
+          const atual = loadState();
+          const alvo = acharItem(atual, pendentes[i]);
+          if (!alvo || alvo.status !== 'pendente') continue;
+          alvo.status = 'em_andamento';
+          alvo.ultimoSinal = Date.now();
+          saveState(atual);
+          if (!abrirAbaParaItem(alvo)) {
+            assumirTarefaNestaAba(alvo);
+            return;
+          }
+          await sleep(CONFIG.multiAba.atrasoEntreAberturasMs);
+        }
+
+        renderStatus();
+        await sleep(CONFIG.multiAba.intervaloSupervisaoMs);
+      }
+    } finally {
+      supervisionando = false;
+    }
+  }
+
+  // A aba nova nasce na MESMA URL desta (que já está autenticada e tem a caixa
+  // de busca) com a tarefa no fragmento. Não dá para montar a URL direta do
+  // processo: ela leva um `hash=` que o eproc gera e que não temos.
+  function urlBaseParaAbas() {
+    return location.href.split('#')[0];
+  }
+
+  function abrirAbaParaItem(item) {
+    const tarefa = { tipo: item.tipo, numero: item.numero, processoPai: item.processoPai || null };
+    const url = `${urlBaseParaAbas()}#eprocdl=${encodeURIComponent(JSON.stringify(tarefa))}`;
+    let janela = null;
+    try {
+      janela = window.open(url, '_blank');
+    } catch (e) {
+      janela = null;
+    }
+    if (!janela) {
+      log('O navegador BLOQUEOU a abertura de abas novas (pop-ups). Permita pop-ups para este site — ícone na barra de endereço → "Sempre permitir pop-ups de..." — e clique em "Iniciar" de novo. Enquanto isso, os itens vão rodar um de cada vez NESTA aba.', 'erro');
+      return false;
+    }
+    log(`${rotuloItem(item)}: aba aberta.`);
+    return true;
+  }
+
+  // Plano B quando os pop-ups estão bloqueados: a própria coordenadora faz o
+  // item, e volta a supervisionar quando terminar (ver finalizarTarefa).
+  function assumirTarefaNestaAba(item) {
+    if (loadTarefa()) return;
+    saveTarefa({
+      tipo: item.tipo,
+      numero: item.numero,
+      processoPai: item.processoPai || null,
+      fase: 'buscar',
+      autos: null,
+      abertaPeloScript: false,
+    });
+    log(`${rotuloItem(item)}: rodando nesta mesma aba (modo sequencial).`, 'aviso');
+    sleep(200).then(() => avancarAba());
+  }
+
+  // A aba recém-aberta lê sua tarefa do fragmento da URL e a guarda no
+  // sessionStorage — que é onde ela sobrevive às navegações seguintes.
+  // O fragmento é apagado logo em seguida para que um F5 não reinicie tudo.
+  function adotarTarefaDaUrl() {
+    const m = location.hash.match(/eprocdl=([^&]+)/);
+    if (!m) return;
+    let dados = null;
+    try {
+      dados = JSON.parse(decodeURIComponent(m[1]));
+    } catch (e) {
+      return;
+    }
+    try {
+      history.replaceState(null, '', urlBaseParaAbas());
+    } catch (e) {
+      location.hash = '';
+    }
+    // O Chrome CLONA o sessionStorage da aba de origem para a aba nova: a
+    // marca de coordenadora vem junto e precisa sair, senão esta aba também
+    // começaria a abrir abas.
+    try {
+      sessionStorage.removeItem(COORDENADORA_KEY);
+    } catch (e) { /* nada a fazer */ }
+    saveTarefa({
+      tipo: dados.tipo || 'processo',
+      numero: dados.numero,
+      processoPai: dados.processoPai || null,
+      fase: 'buscar',
+      autos: null,
+      abertaPeloScript: true,
+    });
   }
 
   // ======================================================================
@@ -1684,17 +2432,33 @@
       CONFIG, lerEventos, lerLinhasEventos, localizarEvento1,
       documentosDaLinha, documentoDoLink, eventoDaLinha, descricaoDoEvento,
       tabelaEventos, linhasDeEvento, numeroDoEvento,
+      // v0.5.0: a resolução do link do evento para o arquivo de verdade é a
+      // peça que faltava para o download funcionar — e dá para testá-la sem
+      // o site, alimentando HTML de página intermediária.
+      candidatosDeArquivo, normalizar, pareceHtml,
     };
     return; // não monta painel nem inicia a fila em ambiente de teste
   }
 
   function iniciar() {
+    // 1) Aba recém-aberta pela coordenadora: pega a tarefa do fragmento da URL.
+    //    Antes de montar o painel, para ele já nascer mostrando a tarefa certa.
+    adotarTarefaDaUrl();
     criarPainel();
-    // Retomada automática: se a fila estava em andamento (fase !== 'ocioso')
-    // quando a página anterior navegou para cá, continua sozinho. Se o
-    // usuário pausou (state.pausado) ou não há fila, não faz nada até
-    // clicar em "Iniciar".
-    avancarFila().catch((e) => log(`Erro inesperado ao retomar a fila: ${e.message}`, 'erro'));
+    // 2) Aba de trabalho (inclusive retomando depois de a busca navegar):
+    //    continua de onde parou, a partir do que está no sessionStorage.
+    if (loadTarefa()) {
+      avancarAba().catch((e) => log(`Erro inesperado nesta aba: ${e && e.message ? e.message : e}`, 'erro'));
+      return;
+    }
+    // 3) Aba coordenadora: retoma a supervisão da fila. Só a aba onde se
+    //    clicou "Iniciar" carrega essa marca — sem isso, cada aba de trabalho
+    //    também começaria a abrir abas.
+    if (!ehCoordenadora()) return;
+    const state = loadState();
+    if (state && !state.pausado && state.fila.some((p) => p.status === 'pendente' || p.status === 'em_andamento')) {
+      supervisionar().catch((e) => log(`Supervisão falhou: ${e && e.message ? e.message : e}`, 'erro'));
+    }
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', iniciar);
