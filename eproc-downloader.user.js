@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dossiês de Audiência — Downloader de Autos do eproc
 // @namespace    dossies-audiencia-download
-// @version      0.5.0
+// @version      0.5.1
 // @description  Automatiza busca, identificação de denúncia/IP/mídia e download de autos do eproc para dossiês de audiência. Ver README e docs/DECISOES.md deste repositório para o escopo da v1.
 // @author       lordfenriss
 // @homepageURL  https://github.com/lordfenriss/eproc-download-pub
@@ -192,7 +192,7 @@
     // supervisionar(), no fim do arquivo.
     // ------------------------------------------------------------------
     multiAba: {
-      maxAbasSimultaneas: 4,      // padrão; o painel sobrepõe (opcoes.maxAbas)
+      maxAbasSimultaneas: 2,      // padrão; o painel sobrepõe (opcoes.maxAbas)
       atrasoEntreAberturasMs: 800, // respiro entre window.open, para não parecer rajada
       intervaloSupervisaoMs: 4000,
       // Uma aba que não dá sinal de vida por este tempo é considerada travada:
@@ -241,7 +241,24 @@
   // window.* sobrevivendo a uma navegação.
   // ======================================================================
   function loadState() {
-    return GM_getValue(STATE_KEY, null);
+    const state = GM_getValue(STATE_KEY, null);
+    if (!state) return null;
+    for (const pai of state.fila.filter(p => p.tipo === 'processo')) {
+      for (const ip of GM_getValue(chaveRelato(state, pai, 'ips'), [])) {
+        if (!state.fila.some(p => p.tipo === 'ip' && p.numero === ip && p.processoPai === pai.numero))
+          state.fila.push(itemDeFila(ip, 'ip', pai.numero));
+      }
+    }
+    for (const item of state.fila) {
+      const relato = GM_getValue(chaveRelato(state, item), null);
+      if (relato) Object.assign(item, relato);
+      const sinal = GM_getValue(chaveRelato(state, item, 'vida'), 0);
+      item.ultimoSinal = Math.max(item.ultimoSinal || 0, sinal);
+    }
+    return state;
+  }
+  function chaveRelato(state, item, tipo = 'resultado') {
+    return 'eprocRelato:' + (state.loteId || 'legado') + ':' + JSON.stringify([item.tipo || 'processo', item.numero, item.processoPai || null]) + ':' + tipo;
   }
   function saveState(state) {
     GM_setValue(STATE_KEY, state);
@@ -270,6 +287,7 @@
   //   própria aba, que é o motivo de o estado existir desde a v0.2.0.
   function newState(processos) {
     return {
+      loteId: crypto.randomUUID(),
       fila: processos.map((numero) => itemDeFila(numero, 'processo', null)),
       pausado: false, // true depois de clicar "Parar" — impede retomada automática na próxima carga
     };
@@ -317,6 +335,7 @@
     }
   }
   function saveTarefa(tarefa) {
+    tarefa.loteId ||= loadState()?.loteId || 'avulso';
     try {
       sessionStorage.setItem(TAREFA_KEY, JSON.stringify(tarefa));
     } catch (e) {
@@ -351,15 +370,26 @@
   // reserializada a cada linha.
   const LOG_MAX = 600;
 
+  function chaveColecao(key) {
+    const tarefa = loadTarefa();
+    return key + ':' + (loadState()?.loteId || 'avulso') + ':' + (tarefa ? JSON.stringify([tarefa.tipo, tarefa.numero, tarefa.processoPai || null]) : 'coordenadora');
+  }
+  function lerColecoes(key) {
+    const state = loadState();
+    const prefixo = key + ':' + (state?.loteId || 'avulso') + ':';
+    const keys = new Set([chaveColecao(key), prefixo + 'coordenadora', ...(state?.fila || []).map(t => prefixo + JSON.stringify([t.tipo, t.numero, t.processoPai || null]))]);
+    return [...keys].flatMap(k => GM_getValue(k, [])).sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || '')));
+  }
   function log(mensagem, nivel = 'info') {
     // Com várias abas escrevendo no mesmo log, saber DE QUEM é cada linha é o
     // que torna o log legível. As mensagens que já começam pelo número do
     // processo (a maioria) não ganham prefixo repetido.
+    mensagem = sanitizar(mensagem);
     const prefixo = prefixoDaAba();
     const texto = prefixo && !String(mensagem).startsWith(prefixo) ? `${prefixo}: ${mensagem}` : String(mensagem);
-    const entradas = GM_getValue(LOG_KEY, []);
+    const entradas = GM_getValue(chaveColecao(LOG_KEY), []);
     entradas.push({ ts: new Date().toISOString(), nivel, mensagem: texto });
-    GM_setValue(LOG_KEY, entradas.length > LOG_MAX ? entradas.slice(-LOG_MAX) : entradas);
+    GM_setValue(chaveColecao(LOG_KEY), entradas.length > LOG_MAX ? entradas.slice(-LOG_MAX) : entradas);
     console.log(`[eproc-downloader] [${nivel}] ${texto}`);
     renderLog();
   }
@@ -369,10 +399,10 @@
     return tarefa ? rotuloTarefa(tarefa) : '';
   }
   function getLog() {
-    return GM_getValue(LOG_KEY, []);
+    return lerColecoes(LOG_KEY);
   }
   function clearLog() {
-    GM_deleteValue(LOG_KEY);
+    GM_deleteValue(chaveColecao(LOG_KEY));
   }
 
   // ======================================================================
@@ -715,19 +745,6 @@
   // primeiro arquivo baixado por essa rota realmente abre e não é uma
   // página de login/erro antes de confiar no lote inteiro.
   // ======================================================================
-  function gmDownload(url, nomeArquivo) {
-    return new Promise((resolve, reject) => {
-      GM_download({
-        url,
-        name: nomeArquivo, // barra "/" não cria subpasta real — nunca usar aqui (achado do Manual, 14/08/2026)
-        saveAs: false,
-        onload: () => resolve({}),
-        onerror: (detalhe) => reject(new Error(`GM_download falhou (${(detalhe && detalhe.error) || JSON.stringify(detalhe)})`)),
-        ontimeout: () => reject(new Error('GM_download expirou (timeout)')),
-      });
-    });
-  }
-
   function pareceHtml(contentType) {
     return /text\/html|application\/xhtml/i.test(contentType || '');
   }
@@ -864,7 +881,7 @@
       for (const c of candidatos.slice(1, 6)) trilha.push(`  (descartado) ${c.via}: ${c.url}`);
       url = candidatos[0].url;
     }
-    return { url, contentType: null, bytes: null, trilha, html: null, aviso: `foram seguidas ${CONFIG.documento.maxNiveis} páginas intermediárias sem chegar a um arquivo — baixando o último endereço mesmo assim.` };
+    return { url: null, contentType: null, bytes: null, trilha, html: null, aviso: `foram seguidas ${CONFIG.documento.maxNiveis} páginas intermediárias sem chegar a um arquivo — download interrompido.` };
   }
 
   // Diagnóstico específico de documento: é o que diz, numa rodada, qual é a
@@ -882,7 +899,8 @@
     if (resultado.html) {
       linhas.push('');
       linhas.push('--- HTML da página intermediária (primeiros 6000 caracteres) ---');
-      linhas.push(resultado.html.slice(0, 6000));
+      const estrutura = new DOMParser().parseFromString(resultado.html, 'text/html');
+      linhas.push(Array.from(estrutura.querySelectorAll('iframe,embed,object,a,button,input,form')).slice(0, 40).map(el => el.tagName + ' atributos=' + el.getAttributeNames().join(',') + ' URL=' + sanitizar(urlDoControle(el, location.href) || '(sem URL literal)')).join('\n'));
     }
     return finalizarDiagnostico(linhas, 'eproc-diagnostico-documento');
   }
@@ -890,49 +908,126 @@
   // Baixa um documento do eproc. `href` é o link do evento (página
   // intermediária) — a resolução para o arquivo real é feita aqui dentro.
   // Passe { resolver: false } quando a URL JÁ é o arquivo.
-  async function baixarComoArquivo(href, nomeArquivo, { resolver = true } = {}) {
-    let url = href;
-    if (resolver) {
-      const r = await resolverUrlDocumento(href);
-      if (!r.url) {
-        diagnosticoDocumento(href, r, nomeArquivo);
-        throw new Error(`não foi possível chegar ao arquivo de ${nomeArquivo}: ${r.aviso} Um "eproc-diagnostico-documento-*.txt" foi baixado — mande esse arquivo na conversa.`);
-      }
-      if (r.aviso) log(`${nomeArquivo}: ${r.aviso}`, 'aviso');
-      if (r.url !== href) {
-        log(`${nomeArquivo}: o link do evento era página intermediária; arquivo real em ${r.url.slice(0, 140)}${r.url.length > 140 ? '…' : ''} (${r.contentType || 'tipo desconhecido'}).`);
-      }
-      url = r.url;
-    }
-    try {
-      await gmDownload(url, nomeArquivo);
-    } catch (e) {
-      // GM_download é a via preferida (ver comentário do bloco acima). Quando
-      // ela falha mesmo com a URL já resolvida, a via do blob ainda salva o
-      // arquivo — ao custo de o Chrome poder pedir permissão de "baixar vários
-      // arquivos". Melhor pedir permissão do que perder o documento.
-      log(`${nomeArquivo}: ${e.message}. Tentando pela via alternativa (fetch + blob).`, 'aviso');
-      await baixarPorBlob(url, nomeArquivo);
-    }
+  function sanitizar(texto) {
+    return String(texto).replace(/(?:cookie|authorization)\s*:[^\r\n]+/gi, '[CREDENCIAL REMOVIDA]').replace(/(?:value|data-[\w-]+)\s*=\s*(["'])(.*?)\1/gi, 'valor="[REMOVIDO]"').replace(/((?:https?:\/\/|controlador\.php)[^\s"'<>?]*)(\?[^\s"'<>]*)/gi, '$1?[REMOVIDO]')
+      .replace(/((?:hash|token|sessao|session|senha|password|cookie)[\w-]*\s*[=:]\s*)[^\s&"'<>]+/gi, '$1[REMOVIDO]');
   }
 
-  async function baixarPorBlob(url, nomeArquivo) {
-    const resposta = await fetch(url, { credentials: 'include' });
-    if (!resposta.ok) throw new Error(`servidor respondeu ${resposta.status} ao baixar ${nomeArquivo}.`);
-    const tipo = resposta.headers.get('Content-Type') || '';
-    const blob = await resposta.blob();
-    if (pareceHtml(tipo)) {
-      throw new Error(`o que chegou em ${nomeArquivo} é HTML (${blob.size} bytes), não um arquivo — NÃO foi salvo. Confira se a sessão do eproc ainda está aberta.`);
+  function urlDoControle(el, base) {
+    const diretos = ['href', 'src', 'data', 'data-href', 'data-url'];
+    let valor = diretos.map(a => el.getAttribute(a)).find(v => v && !/^(?:javascript:|#)/i.test(v));
+    if (!valor) {
+      // Apenas literais de navegação conhecidos; nunca executar JavaScript recebido.
+      const js = el.getAttribute('onclick') || el.getAttribute('href') || '';
+      const m = js.match(/(?:window\.open\s*\(|(?:window\.)?location(?:\.href)?\s*=\s*)["']([^"']+)["']/i);
+      valor = m && m[1];
     }
-    const objUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = objUrl;
-    a.download = nomeArquivo;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(objUrl), 60000);
-    log(`${nomeArquivo}: baixado pela via alternativa (${blob.size} bytes, ${tipo || 'tipo desconhecido'}). Se o Chrome perguntar sobre "baixar vários arquivos", clique em Permitir.`, 'aviso');
+    if (!valor) return null;
+    try {
+      const u = new URL(valor, base);
+      if (u.origin !== new URL(base).origin || !/^https?:$/.test(u.protocol)) return null;
+      return u.href;
+    } catch { return null; }
+  }
+
+  async function resolverDocumento(href, pdf = true, visitados = new Set()) {
+    const url = new URL(href, location.href);
+    if (url.origin !== location.origin) throw new Error('Documento fora da origem do eproc; revisão necessária.');
+    if (visitados.has(url.href) || visitados.size >= 6) throw new Error('Página intermediária circular ou profunda demais.');
+    visitados.add(url.href);
+    let resposta;
+    for (let tentativa = 0; tentativa < 3; tentativa++) {
+      try {
+        resposta = await fetch(url.href, { credentials: 'include', signal: AbortSignal.timeout(60000) });
+        if (resposta.ok) break;
+        if (![429, 500, 502, 503, 504].includes(resposta.status)) break;
+      } catch (e) {
+        if (tentativa === 2) throw new Error('Falha ao obter documento; nenhuma gravação iniciada.');
+      }
+      if (tentativa === 2) throw new Error('Servidor indisponível; nenhuma gravação iniciada.');
+      await sleep(1000 * 2 ** tentativa);
+    }
+    if (!resposta?.ok) throw new Error('Servidor recusou o documento: HTTP ' + resposta?.status);
+    const base = resposta.url || url.href;
+    if (new URL(base).origin !== location.origin) throw new Error('Redirecionamento fora do eproc.');
+    const blob = await resposta.blob();
+    const inicio = await blob.slice(0, 1024).text();
+    if (/^%PDF-/.test(inicio)) {
+      const fim = await blob.slice(Math.max(0, blob.size - 4096)).text();
+      if (!fim.includes('%%EOF')) throw new Error('PDF incompleto: marcador final ausente.');
+      return blob;
+    }
+    const html = /html/i.test(blob.type) || /^\s*(?:<!doctype|<html|<head|<body|<script|<form)/i.test(inicio);
+    if (!html) {
+      if (!pdf && blob.size > 0) return blob;
+      throw new Error('Resposta não é PDF; arquivo não foi gravado.');
+    }
+    if (blob.size > 2 * 1024 * 1024) throw new Error('Página intermediária excede o limite.');
+    const doc = new DOMParser().parseFromString(await blob.text(), 'text/html');
+    if (doc.querySelector('input[type="password"]')) throw new Error('Sessão expirada; faça login e retome.');
+    const candidatos = Array.from(doc.querySelectorAll('iframe[src], embed[src], object[data], a, button, input[type="button"], input[type="submit"]'))
+      .filter(el => /^(IFRAME|EMBED|OBJECT)$/.test(el.tagName) || /abrir|baixar|download|visualizar/i.test(el.textContent + ' ' + (el.value || '')))
+      .map(el => urlDoControle(el, base)).filter(Boolean);
+    for (const c of candidatosDeArquivo(await blob.text(), base)) {
+      if (new URL(c.url).origin === location.origin && !/formulário|citado no HTML/.test(c.via)) candidatos.push(c.url);
+    }
+    for (const candidato of new Set(candidatos)) {
+      if (!visitados.has(candidato)) return resolverDocumento(candidato, pdf, visitados);
+    }
+    throw new Error('Página intermediária sem PDF ou botão Abrir resolvível; não foi salva como PDF.');
+  }
+
+  async function baixarComoArquivo(href, nomeArquivo) {
+    if (!navigator.locks) throw new Error('Navegador sem suporte à coordenação de downloads.');
+    return navigator.locks.request('eproc-arquivo:' + nomeArquivo, () => baixarArquivoValidado(href, nomeArquivo));
+  }
+
+  async function baixarArquivoValidado(href, nomeArquivo) {
+    const key = 'eprocDownloads_v2:' + (loadState()?.loteId || 'avulso') + ':' + nomeArquivo;
+    const anterior = JSON.parse(sessionStorage.getItem('eprocDownloadPendente') || 'null');
+    if (anterior && anterior.nomeArquivo !== nomeArquivo) throw new Error('Confira o download pendente antes de iniciar outro arquivo.');
+    const registros = GM_getValue(key, {});
+    if (registros[nomeArquivo] === 'confirmado') return { confirmado: true, existente: true };
+    if (registros[nomeArquivo] === 'iniciado') throw new Error('Download anterior sem confirmação: confira a pasta antes de repetir ' + nomeArquivo);
+    if (loadState()?.pausado) throw new Error('Lote pausado antes do download.');
+    sinalizarVida(loadTarefa());
+    const blob = await resolverDocumento(href, /\.pdf$/i.test(nomeArquivo));
+    sessionStorage.setItem('eprocDownloadPendente', JSON.stringify({key, nomeArquivo}));
+    registros[nomeArquivo] = 'iniciado';
+    GM_setValue(key, registros);
+    // Blob via GM_download requer Tampermonkey 5.4.6226+; não usar clique HTML.
+    await new Promise((resolve, reject) => {
+      let encerrado = false;
+      const timer = setTimeout(() => terminar(new Error('Download sem confirmação no prazo; confira a pasta antes de repetir.')), 180000);
+      function terminar(erro) {
+        if (encerrado) return;
+        encerrado = true; clearTimeout(timer);
+        if (erro) reject(erro); else resolve();
+      }
+      try {
+        GM_download({ url: blob, name: nomeArquivo, saveAs: false,
+          onload: () => terminar(),
+          onerror: () => terminar(new Error('Gerenciador não confirmou o download; confira a pasta e a versão do Tampermonkey.')),
+          ontimeout: () => terminar(new Error('Download expirou sem confirmação.')) });
+      } catch { terminar(new Error('Tampermonkey não aceitou o arquivo validado. Atualize a extensão.')); }
+    });
+    sessionStorage.removeItem('eprocDownloadPendente');
+    registros[nomeArquivo] = 'confirmado';
+    GM_setValue(key, registros);
+    return { confirmado: true, bytes: blob.size };
+  }
+
+  function revisarDownloadPendente() {
+    const pendente = JSON.parse(sessionStorage.getItem('eprocDownloadPendente') || 'null');
+    if (!pendente) { log('Nenhum download sem confirmação nesta aba.'); return; }
+    if (confirm('Confira a pasta de downloads. O arquivo ' + pendente.nomeArquivo + ' existe e abre completo? OK = confirmar arquivo; Cancelar = avaliar nova tentativa.')) {
+      GM_setValue(pendente.key, { [pendente.nomeArquivo]: 'confirmado' });
+    } else {
+      if (!confirm('Confirme que o download NÃO está em andamento e que você removeu qualquer arquivo incompleto antes de tentar novamente.')) return;
+      GM_deleteValue(pendente.key);
+    }
+    sessionStorage.removeItem('eprocDownloadPendente');
+    log('Conferência registrada. Clique Iniciar nesta aba para retomar.');
   }
 
   function nomeSeguro(s) {
@@ -1070,13 +1165,13 @@
   // "documento2.pdf" vira um quebra-cabeça manual.
   // ----------------------------------------------------------------------
   function registrarNoManifesto(entrada) {
-    const manifesto = GM_getValue(MANIFESTO_KEY, []);
+    const manifesto = GM_getValue(chaveColecao(MANIFESTO_KEY), []);
     manifesto.push({ ts: new Date().toISOString(), ...entrada });
-    GM_setValue(MANIFESTO_KEY, manifesto);
+    GM_setValue(chaveColecao(MANIFESTO_KEY), manifesto);
   }
 
   function exportarManifesto() {
-    const manifesto = GM_getValue(MANIFESTO_KEY, []);
+    const manifesto = lerColecoes(MANIFESTO_KEY);
     if (manifesto.length === 0) {
       log('Nada para exportar — nenhum download registrado no manifesto ainda.', 'aviso');
       return;
@@ -1106,12 +1201,7 @@
     if (botoes.length === 0) {
       log(`${numeroProcesso}: tela de download aberta, mas nenhum botão "${CONFIG.labels.baixarArquivo}" foi encontrado. Gerando diagnóstico de tela.`, 'erro');
       diagnosticoTela(`nenhum botão de baixar parte encontrado (processo ${numeroProcesso}${ip ? `, IP ${ip}` : ''})`);
-      return { baixadas: 0, viaClique: 0 };
-    }
-
-    if (botoes.length > CONFIG.downloadCompleto.maxPartes) {
-      log(`${numeroProcesso}: ${botoes.length} botões de parte encontrados, acima do limite de segurança (${CONFIG.downloadCompleto.maxPartes}). Baixando só os primeiros — confira manualmente.`, 'aviso');
-      botoes = botoes.slice(0, CONFIG.downloadCompleto.maxPartes);
+      throw new Error('Nenhuma parte disponível.');
     }
 
     // Ordena pelo número da parte que aparece no rótulo, para PARTE_2 não
@@ -1129,38 +1219,27 @@
       const nome = temPartes
         ? `${prefixo}__AUTOS_PARTE_${parte}.pdf`
         : `${prefixo}__AUTOS.pdf`;
-      const href = botao.tagName === 'A' ? botao.href : '';
-      const hrefUtilizavel = href && /^https?:/i.test(href) && !/^javascript:/i.test(botao.getAttribute('href') || '');
-
-      if (hrefUtilizavel) {
-        try {
-          await baixarComoArquivo(href, nome);
-          registrarNoManifesto({ processo: numeroProcesso, ip, rotulo: textoDeControle(botao), nomeArquivo: nome, viaClique: false });
-          baixadas += 1;
-          aoBaixar(parte);
-          log(`${numeroProcesso}: autos — ${nome} baixado.`);
-        } catch (e) {
-          log(`${numeroProcesso}: falha ao baixar ${nome}: ${e && e.message ? e.message : e}`, 'erro');
-        }
-      } else {
-        // Sem href utilizável: só resta clicar, e quem nomeia é o eproc. O
-        // manifesto guarda o instante do clique para o organizador casar
-        // depois pelo horário do arquivo.
-        // Registrar ANTES do clique: se ele navegar a página, esta aba morre
-        // aqui e retoma em 'baixando' — a parte já contada não é baixada duas
-        // vezes (ver autos.partesFeitas).
-        registrarNoManifesto({ processo: numeroProcesso, ip, rotulo: textoDeControle(botao), nomeArquivo: nome, viaClique: true });
-        aoBaixar(parte);
-        botao.click();
-        viaClique += 1;
-        baixadas += 1;
-        log(`${numeroProcesso}: autos — parte ${parte} baixada por clique (o eproc é quem nomeia o arquivo; o manifesto registra que ela é deste processo${ip ? `, IP ${ip}` : ''}).`, 'aviso');
-        // Respiro entre cliques: downloads em rajada são justamente o que o
-        // Chrome bloqueia (ver comentário de baixarComoArquivo).
-        await sleep(1500);
-      }
+      const href = urlDoControle(botao, location.href);
+      if (!href) throw new Error('Parte sem endereço resolvível: diagnóstico do botão necessário.');
+      await baixarComoArquivo(href, nome);
+      registrarNoManifesto({ processo: numeroProcesso, ip, rotulo: textoDeControle(botao), nomeArquivo: nome, viaClique: false });
+      baixadas++;
+      aoBaixar(parte);
+      log(`${numeroProcesso}: ${nome} confirmado pelo gerenciador.`);
     }
     return { baixadas, viaClique };
+  }
+
+  async function aguardarPartesEstaveis() {
+    let anterior = '', desde = Date.now();
+    for (let i = 0; i < 120; i++) {
+      const links = acharTodosControles(CONFIG.labels.baixarArquivo);
+      const assinatura = links.map(el => textoDeControle(el) + (urlDoControle(el, location.href) || '')).sort().join('|');
+      if (assinatura && assinatura === anterior && Date.now() - desde >= 3000) return;
+      if (assinatura !== anterior) { anterior = assinatura; desde = Date.now(); }
+      await sleep(500);
+    }
+    throw new Error('Links das partes não ficaram disponíveis e estáveis.');
   }
 
   function numeroDaParte(el) {
@@ -1181,7 +1260,9 @@
     const usadas = [];
     let faltando = 0;
     for (const [chave, rotulo] of mapa) {
-      const input = acharCheckboxPorTexto(rotulo, { ignorar: usadas });
+      const ids = { listaEventos: 'Listaeventos', anexosEletronicos: 'AnexosEletronicos', soComDocumentos: 'soComDocumentos' };
+      const input = Array.from(document.querySelectorAll('input[type="checkbox"]')).find(el =>
+        [el.id, el.name].some(v => String(v).toLowerCase() === ids[chave].toLowerCase())) || acharCheckboxPorTexto(rotulo, { ignorar: usadas });
       if (!input) {
         relato.push(`${chave}=NÃO ENCONTRADA`);
         faltando += 1;
@@ -1196,6 +1277,7 @@
       if (input.checked !== desejado) {
         // click() (e não input.checked = ...) de propósito: é o clique que
         // dispara os onclick/onchange que o eproc pendura nessas checkboxes.
+        if (input.disabled) throw new Error('Opção obrigatória desabilitada: ' + chave);
         input.click();
         if (input.checked !== desejado) {
           input.checked = desejado;
@@ -1210,8 +1292,8 @@
     if (faltando > 0) {
       // Sem isso o download sai silenciosamente sem a lista de eventos ou sem
       // os anexos, e ninguém percebe até abrir o PDF.
-      log(`${numeroProcesso}: ${faltando} das 3 opções obrigatórias não foram encontradas na tela. Gerando diagnóstico de tela — mande o .txt para ajustar CONFIG.labels.checkbox*.`, 'erro');
-      diagnosticoTela(`checkbox(es) do Download Completo não encontrada(s) (${numeroProcesso})`);
+      log(`${numeroProcesso}: ${faltando} das 3 opções obrigatórias não foram encontradas na tela. A geração será interrompida; confira as opções na tela.`, 'erro');
+      throw new Error('Opção obrigatória não encontrada; geração interrompida.');
     }
   }
 
@@ -1410,7 +1492,7 @@
         <input type="file" id="eproc-dl-csv" accept=".csv" />
       </div>
       <div>
-        <button id="eproc-dl-iniciar">Iniciar</button>
+        <button id="eproc-dl-iniciar">Iniciar</button><button id="eproc-dl-revisar">Conferir download pendente</button>
         <button id="eproc-dl-parar">Parar</button>
         <button id="eproc-dl-limpar-log">Limpar log</button>
         <button id="eproc-dl-exportar-log">Exportar log</button>
@@ -1439,6 +1521,7 @@
     `;
     document.body.appendChild(painel);
 
+    document.getElementById('eproc-dl-revisar').addEventListener('click', revisarDownloadPendente);
     document.getElementById('eproc-dl-csv').addEventListener('change', onCsvSelecionado);
     document.getElementById('eproc-dl-iniciar').addEventListener('click', iniciarProcessamento);
     document.getElementById('eproc-dl-parar').addEventListener('click', pararProcessamento);
@@ -1650,7 +1733,7 @@
   }
 
   function finalizarDiagnostico(linhas, prefixoNome = 'eproc-diagnostico-eventos') {
-    const texto = `${linhas.join('\n')}\n`;
+    const texto = sanitizar(`${linhas.join('\n')}\n`);
     console.log('[eproc-downloader] DIAGNÓSTICO:\n' + texto);
     const nome = `${prefixoNome}-${new Date().toISOString().replace(/[:.]/g, '-')}.txt`;
     baixarTexto(nome, texto);
@@ -1757,6 +1840,7 @@
   }
 
   function onCsvSelecionado(ev) {
+    if (loadState()?.fila.some(p => p.status === 'em_andamento')) { log('Finalize ou confira as abas em andamento antes de importar outro CSV.', 'erro'); return; }
     const arquivo = ev.target.files[0];
     if (!arquivo) return;
     const leitor = new FileReader();
@@ -1787,6 +1871,11 @@
   }
 
   function iniciarProcessamento() {
+    if (loadTarefa()) {
+      const state = loadState();
+      if (state) { GM_deleteValue(chaveRelato(state, loadTarefa())); state.pausado = false; saveState(state); }
+      avancarAba(); return;
+    }
     const state = loadState();
     if (!state) {
       log('Importe um CSV antes de iniciar.', 'erro');
@@ -1795,16 +1884,6 @@
     // Retomando depois de um "Parar" (ou de uma sessão anterior), itens
     // marcados "em andamento" são de abas que já não existem: voltam para
     // pendente, senão as vagas nunca são liberadas.
-    if (state.pausado) {
-      let devolvidos = 0;
-      for (const item of state.fila) {
-        if (item.status === 'em_andamento') {
-          item.status = 'pendente';
-          devolvidos += 1;
-        }
-      }
-      if (devolvidos > 0) log(`${devolvidos} item(ns) que estavam em andamento voltaram para a fila.`);
-    }
     state.pausado = false;
     saveState(state);
     marcarComoCoordenadora();
@@ -1882,7 +1961,7 @@
       if (!botao) {
         log(`${rotuloAlvo}: botão "${CONFIG.labels.downloadCompleto}" não encontrado nesta tela. Gerando diagnóstico e pulando os autos deste item.`, 'erro');
         diagnosticoTela(`botão "${CONFIG.labels.downloadCompleto}" não encontrado (${rotuloAlvo})`);
-        return 'terminado';
+        throw new Error('Etapa dos autos incompleta; confira a tela.');
       }
       autos.sub = 'opcoes';
       saveTarefa(tarefa); // ANTES do clique: se navegar, a sub-fase já está salva
@@ -1894,7 +1973,7 @@
       if (!apareceu) {
         log(`${rotuloAlvo}: cliquei em "${CONFIG.labels.downloadCompleto}", a página não navegou e a tela de opções não apareceu em ${Math.round(CONFIG.downloadCompleto.timeoutTelaMs / 1000)}s. Se o eproc abriu a tela numa ABA NOVA, é lá que o trabalho continua — esta aba desiste. Gerando diagnóstico.`, 'erro');
         diagnosticoTela(`tela de opções não apareceu depois do clique em "${CONFIG.labels.downloadCompleto}" (${rotuloAlvo})`);
-        return 'terminado';
+        throw new Error('Etapa dos autos incompleta; confira a tela.');
       }
       return 'prosseguir';
     }
@@ -1906,7 +1985,7 @@
       if (!gerar) {
         log(`${rotuloAlvo}: a tela de opções do Download Completo não apareceu (botão "${CONFIG.labels.gerarArquivoCompleto}" não encontrado). Gerando diagnóstico e pulando os autos deste item.`, 'erro');
         diagnosticoTela(`tela de opções não apareceu (${rotuloAlvo})`);
-        return 'terminado';
+        throw new Error('Etapa dos autos incompleta; confira a tela.');
       }
       // Marcar as três opções obrigatórias ANTES de gerar — depois do clique
       // em "Gerar" já não adianta (o PDF sai como as opções estavam).
@@ -1943,10 +2022,11 @@
       }
       log(`${rotuloAlvo}: o arquivo completo não ficou pronto dentro do limite (~${Math.round((CONFIG.pollDownloadCompletoMaxTentativas * CONFIG.pollDownloadCompletoMs) / 60000)} min). Gerando diagnóstico e seguindo — baixe este processo manualmente.`, 'erro');
       diagnosticoTela(`arquivo completo não ficou pronto no limite (${rotuloAlvo})`);
-      return 'terminado';
+      throw new Error('Etapa dos autos incompleta; confira a tela.');
     }
 
     if (autos.sub === 'baixando') {
+      await aguardarPartesEstaveis();
       const resultado = await baixarPartesDosAutos(prefixo, {
         numeroProcesso,
         ip,
@@ -1966,11 +2046,13 @@
     }
 
     log(`${rotuloAlvo}: sub-fase de autos desconhecida ("${autos.sub}") — pulando os autos deste item.`, 'erro');
-    return 'terminado';
+    throw new Error('Etapa dos autos incompleta; confira a tela.');
   }
 
   function temTextoNaPagina(texto) {
-    return normalizar(document.body.innerText || '').includes(normalizar(texto));
+    const body = document.body.cloneNode(true);
+    body.querySelectorAll('#eproc-dl-painel,script,style').forEach(el => el.remove());
+    return normalizar(body.textContent || '').includes(normalizar(texto));
   }
 
   // Prepara a tarefa da aba para entrar na etapa de autos.
@@ -2023,7 +2105,9 @@
   // Número do processo a partir da própria página. Tenta a URL primeiro
   // (num_processo=... vem sem pontuação) e cai para o texto da página.
   function numeroDoProcessoDaPagina() {
-    const daPagina = (document.body.innerText || '').match(
+    const body = document.body.cloneNode(true);
+    body.querySelectorAll('#eproc-dl-painel,script,style').forEach(el => el.remove());
+    const daPagina = (body.textContent || '').match(
       /\d{7}-\d{2}\.\d{4}\.\d\.\d{2}\.\d{4}/
     );
     if (daPagina) return daPagina[0];
@@ -2081,6 +2165,14 @@
   // salvo no sessionStorage.
   // ----------------------------------------------------------------------
   async function avancarAba() {
+    if (!navigator.locks) throw new Error('Navegador sem suporte à coordenação segura de abas.');
+    return navigator.locks.request('eproc:' + JSON.stringify(loadTarefa() && [loadTarefa().tipo, loadTarefa().numero, loadTarefa().processoPai]), { ifAvailable: true }, async lock => {
+      if (!lock) { log('Este trabalho já está ativo em outra aba.', 'aviso'); return; }
+      return avancarAbaInterno();
+    });
+  }
+
+  async function avancarAbaInterno() {
     if (processandoAba) return;
     processandoAba = true;
     try {
@@ -2089,9 +2181,12 @@
         if (!tarefa) return;
 
         const global = loadState();
+        if (tarefa.tipo !== 'avulso' && tarefa.loteId !== (global?.loteId || 'avulso')) throw new Error('Esta aba pertence a outro lote; feche-a para evitar misturar resultados.');
         if (tarefa.tipo !== 'avulso' && global && global.pausado) {
           log(`${rotuloTarefa(tarefa)}: fila pausada — esta aba parou aqui. Clique em "Iniciar" na aba principal para retomar.`, 'aviso');
-          return;
+          sinalizarVida(tarefa);
+          await sleep(2000);
+          continue;
         }
         sinalizarVida(tarefa);
 
@@ -2109,7 +2204,7 @@
           // morre junto com a página e a carga seguinte retoma em 'eventos'.
           // Se NÃO navegar (AJAX), a tabela aparece aqui e seguimos inline.
           const tabela = await aguardarElemento(CONFIG.tabelaEventosSelector, { timeoutMs: 25000 });
-          if (tabela) continue;
+          if (tabela && (numeroDoProcessoDaPagina() || '').replace(/\D/g, '') === tarefa.numero.replace(/\D/g, '')) continue;
           log(`${rotuloTarefa(tarefa)}: busca disparada, mas a página não navegou nem trouxe a tabela de eventos em 25s. Aguardando — se ficar assim, confira o número e recarregue esta aba.`, 'aviso');
           return;
         }
@@ -2120,6 +2215,7 @@
             finalizarTarefa(tarefa, 'erro', 'a tabela de eventos não apareceu depois da busca — confira o número do processo');
             return;
           }
+          if ((numeroDoProcessoDaPagina() || '').replace(/\D/g, '') !== tarefa.numero.replace(/\D/g, '')) throw new Error('A página aberta não corresponde ao processo solicitado.');
           await carregarTodosOsEventos();
           const eventos = lerEventos();
           const linhasEventos = lerLinhasEventos(eventos);
@@ -2145,6 +2241,7 @@
             } catch (e) {
               // A denúncia é importante, mas os AUTOS são o que não pode faltar
               // no dia da audiência: um erro aqui não derruba o resto.
+              tarefa.falhaParcial = true; saveTarefa(tarefa);
               log(`${tarefa.numero}: falha ao baixar a denúncia (${e && e.message ? e.message : e}) — seguindo para os autos.`, 'erro');
             }
           }
@@ -2182,7 +2279,7 @@
         }
 
         if (tarefa.fase === 'concluir') {
-          finalizarTarefa(tarefa, 'concluido', '');
+          finalizarTarefa(tarefa, tarefa.falhaParcial ? 'erro' : 'concluido', tarefa.falhaParcial ? 'Autos processados, mas houve falha em documento; confira o log.' : '');
           return;
         }
 
@@ -2214,34 +2311,23 @@
     if (agora - ultimoSinalEnviado < 20000) return;
     ultimoSinalEnviado = agora;
     const state = loadState();
-    const item = acharItem(state, tarefa);
-    if (!item) return;
-    item.ultimoSinal = agora;
-    saveState(state);
+    if (state) GM_setValue(chaveRelato(state, tarefa, 'vida'), agora);
   }
 
   // O status final é a única escrita que não pode se perder numa corrida entre
   // abas: confere e reescreve até valer.
   function finalizarTarefa(tarefa, status, observacao) {
     if (tarefa.tipo === 'avulso') {
+      if (status === 'erro') { log(observacao, 'erro'); return; }
       clearTarefa();
       log(`${tarefa.numero}: autos desta página processados (modo avulso). A fila do CSV não foi tocada.`);
       renderStatus();
       return;
     }
 
-    for (let tentativa = 0; tentativa < 3; tentativa++) {
-      const state = loadState();
-      const item = acharItem(state, tarefa);
-      if (!item) break;
-      item.status = status;
-      item.observacao = observacao || '';
-      item.ultimoSinal = Date.now();
-      saveState(state);
-      const conferencia = acharItem(loadState(), tarefa);
-      if (conferencia && conferencia.status === status) break;
-    }
-    clearTarefa();
+    const state = loadState();
+    if (state) GM_setValue(chaveRelato(state, tarefa), { status, observacao: sanitizar(observacao || ''), ultimoSinal: Date.now() });
+    if (status === 'concluido') clearTarefa();
     log(
       status === 'concluido'
         ? `${rotuloTarefa(tarefa)}: concluído.`
@@ -2251,7 +2337,7 @@
     renderStatus();
 
     const opcoes = loadOpcoes();
-    if (tarefa.abertaPeloScript && opcoes.fecharAba) {
+    if (status === 'concluido' && tarefa.abertaPeloScript && opcoes.fecharAba) {
       log(`${rotuloTarefa(tarefa)}: esta aba fecha em ${Math.round(CONFIG.multiAba.atrasoParaFecharMs / 1000)}s (desmarque "fechar aba ao terminar" no painel para mantê-la aberta).`);
       sleep(CONFIG.multiAba.atrasoParaFecharMs).then(() => {
         try {
@@ -2269,15 +2355,11 @@
   function enfileirarIPs(processoPai, ips) {
     const state = loadState();
     if (!state) return 0;
-    let novos = 0;
-    for (const ip of ips) {
-      const jaTem = state.fila.some((p) => p.tipo === 'ip' && p.numero === ip && p.processoPai === processoPai);
-      if (jaTem) continue;
-      state.fila.push(itemDeFila(ip, 'ip', processoPai));
-      novos += 1;
-    }
-    if (novos > 0) saveState(state);
-    return novos;
+    const key = chaveRelato(state, {numero: processoPai, tipo: 'processo'}, 'ips');
+    const anteriores = GM_getValue(key, []);
+    const todos = [...new Set([...anteriores, ...ips])];
+    GM_setValue(key, todos);
+    return todos.length - anteriores.length;
   }
 
   // ----------------------------------------------------------------------
@@ -2286,6 +2368,14 @@
   // ser quando os pop-ups estão bloqueados (ver assumirTarefaNestaAba).
   // ----------------------------------------------------------------------
   async function supervisionar() {
+    if (!navigator.locks) throw new Error('Navegador sem suporte à coordenação segura de abas.');
+    return navigator.locks.request('eproc:' + 'coordenadora', { ifAvailable: true }, async lock => {
+      if (!lock) { log('Este trabalho já está ativo em outra aba.', 'aviso'); return; }
+      return supervisionarInterno();
+    });
+  }
+
+  async function supervisionarInterno() {
     if (supervisionando) return;
     supervisionando = true;
     try {
@@ -2429,6 +2519,8 @@
   // erros que já custaram três rodadas — o valor está em rodar ESTE código.
   if (typeof globalThis !== 'undefined' && globalThis.__EPROC_TESTE__) {
     globalThis.__EPROC_TESTE__ = {
+      chaveRelato, sinalizarVida, enfileirarIPs, finalizarTarefa, loadTarefa, saveTarefa,
+      baixarComoArquivo, resolverDocumento, urlDoControle, sanitizar, configurarOpcoesDownloadCompleto, avancarAutos, baixarPartesDosAutos, newState, loadState, saveState,
       CONFIG, lerEventos, lerLinhasEventos, localizarEvento1,
       documentosDaLinha, documentoDoLink, eventoDaLinha, descricaoDoEvento,
       tabelaEventos, linhasDeEvento, numeroDoEvento,
@@ -2441,6 +2533,7 @@
   }
 
   function iniciar() {
+    if (window.top !== window.self) return;
     // 1) Aba recém-aberta pela coordenadora: pega a tarefa do fragmento da URL.
     //    Antes de montar o painel, para ele já nascer mostrando a tarefa certa.
     adotarTarefaDaUrl();
@@ -2466,3 +2559,4 @@
     iniciar();
   }
 })();
+

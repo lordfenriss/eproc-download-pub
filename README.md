@@ -1,28 +1,13 @@
-# eproc-download-pub
+# Downloader de autos do eproc
 
-Espelho **público** do userscript `eproc-downloader.user.js`, usado só como
-fonte de auto-update do Tampermonkey.
+Versão **0.5.1**.
 
-O desenvolvimento acontece no repositório privado
-`lordfenriss/dossies-audiencia-download` — este aqui contém apenas o arquivo do
-userscript, porque o Tampermonkey não consegue baixar de um repositório privado
-sem autenticação.
+[Instalar ou atualizar no Tampermonkey](https://raw.githubusercontent.com/lordfenriss/eproc-download-pub/main/eproc-downloader.user.js)
 
-## Instalar
+Use Tampermonkey atualizado, com suporte a download de Blob (5.4.6226+), e recarregue o eproc após atualizar. Mantenha só uma cópia do userscript habilitada.
 
-Abra este link no navegador com o Tampermonkey instalado — ele intercepta URLs
-terminadas em `.user.js` e oferece instalar:
+A fila CSV abre abas de processos e IPs com concorrência configurável (padrão 2). O script marca as três opções de Download Completo, aguarda geração e links estáveis e baixa as partes detectadas em ordem. Valida cabeçalho e marcador final do PDF e aguarda confirmação do gerenciador. Se o resultado de um download for incerto, use **Conferir download pendente**, confira a pasta e clique **Iniciar** na mesma aba.
 
-<https://raw.githubusercontent.com/lordfenriss/eproc-download-pub/main/eproc-downloader.user.js>
+Testes locais passaram; ainda é necessária validação no eproc real. Botões dependentes de JavaScript sem URL literal ou formulários POST podem exigir adaptação. Arquivos grandes usam memória para validação. Mais abas não garantem mais velocidade. Permita pop-ups para o eproc se desejar processamento paralelo.
 
-Instalando por aí (e não colando o código à mão), o Tampermonkey passa a
-conferir atualizações sozinho.
-
-## Atualizar
-
-Automático. O Tampermonkey confere periodicamente (padrão: uma vez por dia) e
-avisa quando o `@version` muda. Para forçar agora: painel do Tampermonkey →
-**Utilitários** → *Procurar atualizações de userscript*.
-
-O `raw.githubusercontent.com` tem cache de alguns minutos — se acabou de sair
-uma versão, pode levar ~5 minutos para aparecer.
+Este repositório contém somente o userscript e instruções públicas. Não envie cookies, tokens, documentos judiciais ou URLs autenticadas em relatos de falha.
